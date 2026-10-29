@@ -1,0 +1,25 @@
+services:
+  soulkeeper:
+    image: ${SOULKEEPER_IMAGE:-soulkeeper:local}
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8085}:8000"
+    environment:
+      LUKAS_PASSWORD: ${LUKAS_PASSWORD:?Set LUKAS_PASSWORD in .env}
+      OLI_PASSWORD: ${OLI_PASSWORD:?Set OLI_PASSWORD in .env}
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:8085}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    volumes:
+      - soulkeeper-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  soulkeeper-data:

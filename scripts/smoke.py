@@ -1,0 +1,72 @@
+"""Container integration checks against the disposable database created by container-smoke.sh."""
+import http.cookiejar
+import json
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BASE = "http://127.0.0.1:18085"
+config = dict(line.split("=", 1) for line in Path(sys.argv[1]).read_text().splitlines())
+
+
+class Client:
+    def __init__(self):
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.csrf = None
+
+    def call(self, path, data=None, method=None, expected=200):
+        headers = {"Origin": BASE}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if self.csrf:
+            headers["X-CSRF-Token"] = self.csrf
+        req = urllib.request.Request(BASE + path, data=json.dumps(data).encode() if data is not None else None,
+                                     headers=headers, method=method)
+        try:
+            response = self.opener.open(req, timeout=10)
+        except urllib.error.HTTPError as error:
+            assert error.code == expected, (path, error.code, error.read().decode())
+            return None
+        assert response.status == expected, (path, response.status)
+        payload = json.load(response)
+        if "csrf_token" in payload:
+            self.csrf = payload["csrf_token"]
+        return payload
+
+    def login(self, username):
+        return self.call("/api/login", {"username": username, "password": config[f"{username.upper()}_PASSWORD"]})
+
+
+public = Client()
+with urllib.request.urlopen(BASE + "/competitions/1") as response:
+    assert response.status == 200 and b'<html' in response.read().lower()
+lukas, oli = Client(), Client()
+lukas.login("lukas")
+oli.login("oli")
+if sys.argv[2] == "before":
+    initial = public.call("/api/competitions")
+    assert initial["current_id"] == 1
+    run = lukas.call("/api/competitions/1/attempt/start", {})
+    assert len(run["encounters"]) == 86
+    assert sum(e["points"] for e in run["encounters"]) == 310
+    boss = next(e for e in run["encounters"] if e["kind"] == "boss")
+    path = f'/api/competitions/1/attempt/encounters/{boss["id"]}'
+    lukas.call(path, {"defeated": True}, "PUT")
+    lukas.call(path, {"defeated": True}, "PUT")
+    assert oli.call("/api/competitions/1/attempt")["attempt"] is None
+    lukas.call("/api/competitions/1/attempt/finish", {"outcome": "failed"})
+    oli.call("/api/competitions", {"expected_current_id": 1}, expected=403)
+    lukas.call("/api/competitions", {"expected_current_id": 1})
+    lukas.call(path, {"defeated": False}, "PUT", expected=409)
+else:
+    competitions = public.call("/api/competitions")
+    assert competitions["current_id"] == 2 and len(competitions["competitions"]) == 2
+    old = public.call("/api/competitions/1/leaderboard")
+    assert old["competition"]["status"] == "archived"
+    player = next(p for p in old["players"] if p["username"] == "lukas")
+    assert player["points"] == 5 and player["attempt_status"] == "failed"
+    assert lukas.call("/api/competitions/1/attempt")["attempt"]["points"] == 5
+    assert lukas.call("/api/competitions/2/attempt")["attempt"] is None
+    assert oli.call("/api/competitions/2/attempt")["attempt"] is None
+print(f'Container smoke checks passed ({sys.argv[2]} recreation).')

@@ -34,8 +34,8 @@ class Client:
             self.csrf = payload["csrf_token"]
         return payload
 
-    def login(self, username):
-        return self.call("/api/login", {"username": username, "password": config[f"{username.upper()}_PASSWORD"]})
+    def login(self, username, password=None):
+        return self.call("/api/login", {"username": username, "password": password or config[f"{username.upper()}_PASSWORD"]})
 
 
 public = Client()
@@ -47,6 +47,9 @@ oli.login("oli")
 if sys.argv[2] == "before":
     initial = public.call("/api/competitions")
     assert initial["current_id"] == 1
+    assert len(lukas.call("/api/admin/users")["users"]) == 2
+    oli.call("/api/admin/users", expected=403)
+    lukas.call("/api/admin/users", {"username": "solaire", "password": config["OLI_PASSWORD"] + "-sun"}, expected=201)
     run = lukas.call("/api/competitions/1/attempt/start", {})
     assert len(run["encounters"]) == 86
     assert sum(e["points"] for e in run["encounters"]) == 310
@@ -56,8 +59,18 @@ if sys.argv[2] == "before":
     lukas.call(path, {"defeated": True}, "PUT")
     assert oli.call("/api/competitions/1/attempt")["attempt"] is None
     lukas.call("/api/competitions/1/attempt/finish", {"outcome": "failed"})
-    oli.call("/api/competitions", {"expected_current_id": 1}, expected=403)
-    lukas.call("/api/competitions", {"expected_current_id": 1})
+    selected = {"expected_current_id": 1, "participants": ["lukas", "solaire"]}
+    oli.call("/api/competitions", selected, expected=403)
+    lukas.call("/api/competitions", selected)
+    oli.call("/api/competitions/2/attempt", expected=403)
+    assert {p["username"] for p in public.call("/api/competitions/2/leaderboard")["players"]} == {"lukas", "solaire"}
+    members_path = "/api/admin/competitions/2/participants"
+    lukas.call(members_path, {"participants": ["lukas", "oli", "solaire"]}, "PUT")
+    assert oli.call("/api/competitions/2/attempt")["attempt"] is None
+    lukas.call(members_path, {"participants": ["lukas", "solaire"]}, "PUT")
+    lukas.call("/api/admin/users/solaire", {"password": config["LUKAS_PASSWORD"] + "-sun"}, "PATCH")
+    lukas.call("/api/admin/users/solaire", {"active": False}, "PATCH")
+    lukas.call("/api/admin/users/solaire", {"active": True}, "PATCH")
     lukas.call(path, {"defeated": False}, "PUT", expected=409)
 else:
     competitions = public.call("/api/competitions")
@@ -68,5 +81,12 @@ else:
     assert player["points"] == 5 and player["attempt_status"] == "failed"
     assert lukas.call("/api/competitions/1/attempt")["attempt"]["points"] == 5
     assert lukas.call("/api/competitions/2/attempt")["attempt"] is None
-    assert oli.call("/api/competitions/2/attempt")["attempt"] is None
+    oli.call("/api/competitions/2/attempt", expected=403)
+    assert {p["username"] for p in old["players"]} == {"lukas", "oli"}
+    assert {p["username"] for p in public.call("/api/competitions/2/leaderboard")["players"]} == {"lukas", "solaire"}
+    assert len(lukas.call("/api/admin/users")["users"]) == 3
+    solaire = Client()
+    solaire.login("solaire", config["LUKAS_PASSWORD"] + "-sun")
+    assert solaire.call("/api/competitions/2/attempt")["attempt"] is None
+    solaire.call("/api/competitions/1/attempt", expected=403)
 print(f'Container smoke checks passed ({sys.argv[2]} recreation).')

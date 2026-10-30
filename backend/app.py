@@ -19,9 +19,10 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
-USERS = ("lukas", "oli")
+BOOTSTRAP_USERS = ("lukas", "oli")
+ADMIN = "lukas"
 COOKIE_NAME = "soulkeeper_session"
 SESSION_SECONDS = 7 * 24 * 60 * 60
 PASSWORD_WORK = {"n": 16384, "r": 8, "p": 1, "dklen": 32}
@@ -29,17 +30,13 @@ PASSWORD_WORK = {"n": 16384, "r": 8, "p": 1, "dklen": 32}
 
 @dataclass(frozen=True)
 class Settings:
-    passwords: dict[str, str] = field(repr=False)
+    passwords: dict[str, str] = field(default_factory=dict, repr=False)
     data_dir: Path = Path("data")
     frontend_dist: Path = Path("frontend/dist")
     app_origin: str = "http://localhost:8000"
     cookie_secure: bool = False
 
     def __post_init__(self):
-        if set(self.passwords) != set(USERS) or not all(self.passwords.values()):
-            raise ValueError("LUKAS_PASSWORD and OLI_PASSWORD must both be set")
-        if self.passwords["lukas"] == self.passwords["oli"]:
-            raise ValueError("LUKAS_PASSWORD and OLI_PASSWORD must be different")
         origin = urlsplit(self.app_origin)
         if (
             origin.scheme not in ("http", "https")
@@ -54,7 +51,7 @@ class Settings:
     @classmethod
     def from_env(cls):
         return cls(
-            passwords={name: os.environ.get(f"{name.upper()}_PASSWORD", "") for name in USERS},
+            passwords={name: os.environ.get(f"{name.upper()}_PASSWORD", "") for name in BOOTSTRAP_USERS},
             data_dir=Path(os.environ.get("DATA_DIR", "data")),
             frontend_dist=Path(os.environ.get("FRONTEND_DIST", "frontend/dist")),
             app_origin=os.environ.get("APP_ORIGIN", "http://localhost:8000").rstrip("/"),
@@ -102,14 +99,43 @@ class Database:
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError("This database requires a newer version of Soulkeeper")
+            if version == 0:
+                passwords = [settings.passwords.get(username, "") for username in BOOTSTRAP_USERS]
+                if any(not 12 <= len(password) <= 1024 or not password.strip() for password in passwords):
+                    raise ValueError("Set LUKAS_PASSWORD and OLI_PASSWORD to 12–1024 characters for initial setup")
+                if passwords[0] == passwords[1]:
+                    raise ValueError("Initial player passwords must be different")
+            if version == 1:
+                # Rebuild only the users table: its v1 CHECK restricts names to
+                # Lukas/Oli. Keep existing salts, hashes, sessions and all results.
+                connection.execute("PRAGMA foreign_keys=OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute("CREATE TABLE users_v2 (username TEXT PRIMARY KEY, password_salt BLOB NOT NULL, password_hash BLOB NOT NULL, active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), auth_version INTEGER NOT NULL DEFAULT 0)")
+                    connection.execute("INSERT INTO users_v2 SELECT username,password_salt,password_hash,1,0 FROM users")
+                    connection.execute("DROP TABLE users")
+                    connection.execute("ALTER TABLE users_v2 RENAME TO users")
+                    connection.execute("CREATE TABLE competition_members (competition_id INTEGER NOT NULL REFERENCES competitions(id), username TEXT NOT NULL REFERENCES users(username), PRIMARY KEY(competition_id,username))")
+                    connection.execute("INSERT INTO competition_members SELECT c.id,u.username FROM competitions c CROSS JOIN users u")
+                    if connection.execute("PRAGMA foreign_key_check").fetchall():
+                        raise RuntimeError("Database migration failed its foreign key check")
+                    connection.execute("PRAGMA user_version=2")
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA foreign_keys=ON")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS users (
-                    username TEXT PRIMARY KEY CHECK(username IN ('lukas', 'oli')),
+                    username TEXT PRIMARY KEY,
                     password_salt BLOB NOT NULL,
-                    password_hash BLOB NOT NULL
+                    password_hash BLOB NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                    auth_version INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY,
@@ -127,6 +153,11 @@ class Database:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS one_current_competition
                     ON competitions(status) WHERE status = 'current';
+                CREATE TABLE IF NOT EXISTS competition_members (
+                    competition_id INTEGER NOT NULL REFERENCES competitions(id),
+                    username TEXT NOT NULL REFERENCES users(username),
+                    PRIMARY KEY (competition_id, username)
+                );
                 CREATE TABLE IF NOT EXISTS encounters (
                     competition_id INTEGER NOT NULL REFERENCES competitions(id),
                     id TEXT NOT NULL,
@@ -155,26 +186,17 @@ class Database:
                     FOREIGN KEY (competition_id, encounter_id)
                         REFERENCES encounters(competition_id, id)
                 );
-                PRAGMA user_version=1;
                 """
             )
         self.path.chmod(0o600)
         with self.transaction() as connection:
-            for username in USERS:
-                existing = connection.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-                if existing and hmac.compare_digest(
-                    existing["password_hash"], password_hash(settings.passwords[username], existing["password_salt"])
-                ):
-                    continue
-                salt = secrets.token_bytes(16)
-                connection.execute(
-                    "INSERT INTO users VALUES (?, ?, ?) ON CONFLICT(username) DO UPDATE SET "
-                    "password_salt=excluded.password_salt, password_hash=excluded.password_hash",
-                    (username, salt, password_hash(settings.passwords[username], salt)),
-                )
-                connection.execute("DELETE FROM sessions WHERE username=?", (username,))
+            if version == 0:
+                for username in BOOTSTRAP_USERS:
+                    salt = secrets.token_bytes(16)
+                    connection.execute("INSERT INTO users VALUES (?, ?, ?, 1, 0)", (username, salt, password_hash(settings.passwords[username], salt)))
             if not connection.execute("SELECT 1 FROM competitions LIMIT 1").fetchone():
-                self.create_competition(connection, 1, now())
+                self.create_competition(connection, 1, now(), list(BOOTSTRAP_USERS))
+            connection.execute("PRAGMA user_version=2")
 
     @contextmanager
     def connect(self):
@@ -198,11 +220,12 @@ class Database:
                 connection.rollback()
                 raise
 
-    def create_competition(self, connection, number: int, timestamp: str) -> int:
+    def create_competition(self, connection, number: int, timestamp: str, participants: list[str], name: str | None = None) -> int:
         competition_id = connection.execute(
             "INSERT INTO competitions(number, name, status, created_at) VALUES (?, ?, 'current', ?)",
-            (number, f"Competition {number}", timestamp),
+            (number, name or f"Competition {number}", timestamp),
         ).lastrowid
+        connection.executemany("INSERT INTO competition_members VALUES (?, ?)", [(competition_id, username) for username in participants])
         connection.executemany(
             "INSERT INTO encounters(competition_id, id, data, kind, points, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
             [
@@ -237,6 +260,7 @@ def totals(connection, competition_id: int, username: str) -> dict:
 
 def attempt_view(connection, competition_id: int, username: str) -> dict:
     current_competition = competition(connection, competition_id)
+    ensure_member(connection, competition_id, username)
     attempt = connection.execute(
         "SELECT status, started_at, ended_at FROM attempts WHERE competition_id=? AND username=?",
         (competition_id, username),
@@ -267,6 +291,7 @@ def ensure_current(connection, competition_id: int):
 
 def ensure_active(connection, competition_id: int, username: str):
     ensure_current(connection, competition_id)
+    ensure_member(connection, competition_id, username)
     row = connection.execute(
         "SELECT * FROM attempts WHERE competition_id=? AND username=?", (competition_id, username)
     ).fetchone()
@@ -275,6 +300,35 @@ def ensure_active(connection, competition_id: int, username: str):
     if row["status"] != "active":
         raise HTTPException(409, "This attempt has ended and cannot be changed")
     return row
+
+
+def ensure_member(connection, competition_id: int, username: str):
+    if not connection.execute("SELECT 1 FROM competition_members WHERE competition_id=? AND username=?", (competition_id, username)).fetchone():
+        raise HTTPException(403, "You are not a participant in this competition")
+
+
+def user_view(row) -> dict:
+    return {"username": row["username"], "active": bool(row["active"]), "can_manage": row["username"] == ADMIN}
+
+
+def validate_participants(connection, participants: list[str], existing: set[str] | None = None):
+    if not participants or len(participants) != len(set(participants)):
+        raise HTTPException(422, "Choose at least one participant without duplicates")
+    existing = existing or set()
+    for username in participants:
+        user = connection.execute("SELECT active FROM users WHERE username=?", (username,)).fetchone()
+        if not user or (not user["active"] and username not in existing):
+            raise HTTPException(422, "Participants must be existing active players")
+
+
+def ensure_live_session(connection, authenticated):
+    # Serialize writes with password resets/deactivation so a request already
+    # authenticating cannot recreate access after its session was revoked.
+    if not connection.execute(
+        "SELECT 1 FROM sessions s JOIN users u ON u.username=s.username WHERE s.token_hash=? AND s.expires_at>? AND u.active=1",
+        (authenticated["token_hash"], now()),
+    ).fetchone():
+        raise HTTPException(401, "Please sign in")
 
 
 class Input(BaseModel):
@@ -294,8 +348,40 @@ class Finish(Input):
     outcome: Literal["failed", "completed"]
 
 
-class NewCompetition(Input):
+Username = Annotated[str, Field(pattern=r"^[a-z0-9_-]{3,32}$", strict=True)]
+Password = Annotated[str, Field(min_length=12, max_length=1024, strict=True)]
+
+
+class Participants(Input):
+    participants: list[Username]
+
+
+class NewCompetition(Participants):
     expected_current_id: StrictInt
+    name: str | None = Field(default=None, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("Competition name cannot be empty")
+        return value.strip() if value is not None else None
+
+
+class CreateUser(Input):
+    username: Username
+    password: Password
+
+
+class UpdateUser(Input):
+    password: Password | None = None
+    active: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def nonempty_update(self):
+        if not self.model_fields_set or any(getattr(self, key) is None for key in self.model_fields_set):
+            raise ValueError("Provide a password or active status")
+        return self
 
 
 def create_app(settings: Settings | None = None, catalog_path: Path | None = None) -> FastAPI:
@@ -340,7 +426,7 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         with request.app.state.db.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM sessions WHERE token_hash=? AND expires_at>?", (token_hash, now())
+                "SELECT s.* FROM sessions s JOIN users u ON u.username=s.username WHERE token_hash=? AND expires_at>? AND u.active=1", (token_hash, now())
             ).fetchone()
         return dict(row) if row else None
 
@@ -360,11 +446,21 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
             raise HTTPException(403, "Invalid CSRF token")
         return authenticated
 
+    def require_admin(authenticated: Annotated[dict, Depends(require_session)]):
+        if authenticated["username"] != ADMIN:
+            raise HTTPException(403, "Only lukas can manage players and competitions")
+        return authenticated
+
+    def require_admin_csrf(authenticated: Annotated[dict, Depends(require_csrf)]):
+        if authenticated["username"] != ADMIN:
+            raise HTTPException(403, "Only lukas can manage players and competitions")
+        return authenticated
+
     def session_view(authenticated):
         return {
             "user": {
                 "username": authenticated["username"],
-                "can_manage": authenticated["username"] == "lukas",
+                "can_manage": authenticated["username"] == ADMIN,
             } if authenticated else None,
             "csrf_token": authenticated["csrf_token"] if authenticated else None,
         }
@@ -397,7 +493,7 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
             account = connection.execute("SELECT * FROM users WHERE username=?", (payload.username,)).fetchone()
         salt = account["password_salt"] if account else bytes(16)
         candidate = password_hash(payload.password, salt)
-        if account is None or not hmac.compare_digest(account["password_hash"], candidate):
+        if account is None or not account["active"] or not hmac.compare_digest(account["password_hash"], candidate):
             raise HTTPException(401, "Incorrect username or password")
         with request.app.state.login_lock:
             request.app.state.login_failures[address].remove(timestamp)
@@ -405,6 +501,14 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
         expires_at = (datetime.now(UTC) + timedelta(seconds=SESSION_SECONDS)).isoformat().replace("+00:00", "Z")
         with request.app.state.db.transaction() as connection:
+            current_account = connection.execute("SELECT * FROM users WHERE username=?", (payload.username,)).fetchone()
+            if (
+                not current_account["active"]
+                or current_account["auth_version"] != account["auth_version"]
+                or not hmac.compare_digest(current_account["password_salt"], account["password_salt"])
+                or not hmac.compare_digest(current_account["password_hash"], account["password_hash"])
+            ):
+                raise HTTPException(401, "Incorrect username or password")
             connection.execute("DELETE FROM sessions WHERE expires_at<=?", (now(),))
             existing_token = request.cookies.get(COOKIE_NAME)
             if existing_token:
@@ -423,6 +527,63 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
         response.delete_cookie(COOKIE_NAME, path="/", secure=request.app.state.settings.cookie_secure, httponly=True, samesite="strict")
         return session_view(None)
 
+    @application.get("/api/admin/users")
+    def list_users(request: Request, authenticated: Annotated[dict, Depends(require_admin)]):
+        with request.app.state.db.connect() as connection:
+            return {"users": [user_view(row) for row in connection.execute("SELECT username,active FROM users ORDER BY username")]}
+
+    @application.post("/api/admin/users", status_code=201)
+    def create_user(payload: CreateUser, request: Request, authenticated: Annotated[dict, Depends(require_admin_csrf)]):
+        salt = secrets.token_bytes(16)
+        hashed = password_hash(payload.password, salt)
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            if connection.execute("SELECT 1 FROM users WHERE username=?", (payload.username,)).fetchone():
+                raise HTTPException(409, "This username already exists")
+            connection.execute("INSERT INTO users VALUES (?, ?, ?, 1, 0)", (payload.username, salt, hashed))
+            return {"user": user_view({"username": payload.username, "active": True})}
+
+    @application.patch("/api/admin/users/{username}")
+    def update_user(username: str, payload: UpdateUser, request: Request, authenticated: Annotated[dict, Depends(require_admin_csrf)]):
+        if username == ADMIN and payload.active is False:
+            raise HTTPException(422, "Lukas cannot be deactivated")
+        salt = secrets.token_bytes(16) if payload.password is not None else None
+        hashed = password_hash(payload.password, salt) if payload.password is not None else None
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            account = connection.execute("SELECT active FROM users WHERE username=?", (username,)).fetchone()
+            if account is None:
+                raise HTTPException(404, "Player not found")
+            if hashed is not None:
+                connection.execute("UPDATE users SET password_salt=?,password_hash=? WHERE username=?", (salt, hashed, username))
+            if payload.active is not None:
+                connection.execute("UPDATE users SET active=? WHERE username=?", (int(payload.active), username))
+            if hashed is not None or (payload.active is not None and bool(account["active"]) != payload.active):
+                connection.execute("UPDATE users SET auth_version=auth_version+1 WHERE username=?", (username,))
+            if hashed is not None or payload.active is False:
+                connection.execute("DELETE FROM sessions WHERE username=?", (username,))
+            return {"user": user_view(connection.execute("SELECT username,active FROM users WHERE username=?", (username,)).fetchone())}
+
+    @application.get("/api/admin/competitions/{competition_id}/participants")
+    def get_participants(competition_id: int, request: Request, authenticated: Annotated[dict, Depends(require_admin)]):
+        with request.app.state.db.connect() as connection:
+            competition(connection, competition_id)
+            return {"participants": [row[0] for row in connection.execute("SELECT username FROM competition_members WHERE competition_id=? ORDER BY username", (competition_id,))]}
+
+    @application.put("/api/admin/competitions/{competition_id}/participants")
+    def set_participants(competition_id: int, payload: Participants, request: Request, authenticated: Annotated[dict, Depends(require_admin_csrf)]):
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            ensure_current(connection, competition_id)
+            existing = {row[0] for row in connection.execute("SELECT username FROM competition_members WHERE competition_id=?", (competition_id,))}
+            validate_participants(connection, payload.participants, existing)
+            for username in existing - set(payload.participants):
+                if connection.execute("SELECT 1 FROM attempts WHERE competition_id=? AND username=?", (competition_id, username)).fetchone():
+                    raise HTTPException(409, "Players whose attempts have started cannot be removed")
+            connection.executemany("DELETE FROM competition_members WHERE competition_id=? AND username=?", [(competition_id, username) for username in existing - set(payload.participants)])
+            connection.executemany("INSERT INTO competition_members VALUES (?, ?)", [(competition_id, username) for username in set(payload.participants) - existing])
+            return {"participants": sorted(payload.participants)}
+
     @application.get("/api/competitions")
     def list_competitions(request: Request):
         with request.app.state.db.connect() as connection:
@@ -439,7 +600,8 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
             connection.execute("BEGIN")
             selected = competition(connection, competition_id)
             players = []
-            for username in USERS:
+            members = [row[0] for row in connection.execute("SELECT username FROM competition_members WHERE competition_id=? ORDER BY username", (competition_id,))]
+            for username in members:
                 attempt = connection.execute(
                     "SELECT status FROM attempts WHERE competition_id=? AND username=?", (competition_id, username)
                 ).fetchone()
@@ -447,7 +609,7 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
                     "username": username, "attempt_status": attempt["status"] if attempt else "not_started",
                     **totals(connection, competition_id, username),
                 })
-            players.sort(key=lambda player: (-player["points"], USERS.index(player["username"])))
+            players.sort(key=lambda player: (-player["points"], player["username"]))
             last_points, rank = None, 0
             for index, player in enumerate(players, 1):
                 if player["points"] != last_points:
@@ -465,7 +627,9 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
     @application.post("/api/competitions/{competition_id}/attempt/start")
     def start_attempt(competition_id: int, request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
         with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
             ensure_current(connection, competition_id)
+            ensure_member(connection, competition_id, authenticated["username"])
             existing = connection.execute(
                 "SELECT status FROM attempts WHERE competition_id=? AND username=?", (competition_id, authenticated["username"])
             ).fetchone()
@@ -481,6 +645,7 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
         authenticated: Annotated[dict, Depends(require_csrf)],
     ):
         with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
             ensure_active(connection, competition_id, authenticated["username"])
             if not connection.execute("SELECT 1 FROM encounters WHERE competition_id=? AND id=?", (competition_id, encounter_id)).fetchone():
                 raise HTTPException(404, "Encounter not found")
@@ -499,7 +664,9 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
         authenticated: Annotated[dict, Depends(require_csrf)],
     ):
         with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
             ensure_current(connection, competition_id)
+            ensure_member(connection, competition_id, authenticated["username"])
             existing = connection.execute("SELECT status FROM attempts WHERE competition_id=? AND username=?", (competition_id, authenticated["username"])).fetchone()
             if existing and existing["status"] == payload.outcome:
                 return attempt_view(connection, competition_id, authenticated["username"])
@@ -508,16 +675,16 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
             return attempt_view(connection, competition_id, authenticated["username"])
 
     @application.post("/api/competitions")
-    def new_competition(payload: NewCompetition, request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
-        if authenticated["username"] != "lukas":
-            raise HTTPException(403, "Only lukas can create a competition")
+    def new_competition(payload: NewCompetition, request: Request, authenticated: Annotated[dict, Depends(require_admin_csrf)]):
         with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
             current = connection.execute("SELECT * FROM competitions WHERE status='current'").fetchone()
             if current["id"] != payload.expected_current_id:
                 raise HTTPException(409, "The current competition changed. Refresh before creating another")
+            validate_participants(connection, payload.participants)
             timestamp = now()
             connection.execute("UPDATE competitions SET status='archived', archived_at=? WHERE id=?", (timestamp, current["id"]))
-            new_id = request.app.state.db.create_competition(connection, current["number"] + 1, timestamp)
+            new_id = request.app.state.db.create_competition(connection, current["number"] + 1, timestamp, payload.participants, payload.name)
             return {"competition": competition(connection, new_id), "current_id": new_id}
 
     @application.get("/{path:path}")

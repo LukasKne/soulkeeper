@@ -1,8 +1,10 @@
 # Soulkeeper
 
-A small Dark Souls Remastered no-death competition tracker. Public leaderboards show Lukas and Oli's points and whether their character is alive or dead. Each player has one attempt per competition.
+A small Dark Souls Remastered no-death competition tracker. Public leaderboards show each competition's players, their points, and whether their character is alive or dead. Each assigned player has one attempt per competition.
 
-Lukas can create the next competition from **Manage competitions**. The previous competition stays visible in the selector, with its leaderboard and checklists preserved as read-only records. Each competition has a permanent URL.
+Lukas can manage players and competitions from **Administration** at `/admin`. Create accounts, reset passwords, and deactivate players while preserving their results. Usernames are permanent; there is no public registration.
+
+Create the next competition with a name and a selected group of active players. There is one current competition at a time. The previous competition stays visible in the selector, with its participants, leaderboard, and checklists preserved as read-only records. Each competition has a permanent URL. Participants can be added to the current competition; a player who has started an attempt cannot be removed.
 
 ## Run with Docker
 
@@ -10,13 +12,13 @@ Lukas can create the next competition from **Manage competitions**. The previous
 cp .env.example .env
 ```
 
-Set two different passwords in `.env`, then start:
+Set two different initial passwords in `.env`, then start:
 
 ```sh
 docker compose up -d --build
 ```
 
-Open <http://localhost:8085>. The only accounts are `lukas` and `oli`; there is no registration. Keep `.env` private.
+Open <http://localhost:8085>. The first setup creates `lukas` (administrator) and `oli`, both assigned to Competition 1. Sign in as Lukas to create more accounts. Keep `.env` private.
 
 Progress is stored in the `soulkeeper-data` named volume. Rebuilding or recreating the container preserves it. `docker compose down -v` deletes that volume and all competitions.
 
@@ -26,7 +28,7 @@ Set these `.env` values for your deployment:
 
 | Variable | Value |
 | --- | --- |
-| `LUKAS_PASSWORD`, `OLI_PASSWORD` | Two different private passwords |
+| `LUKAS_PASSWORD`, `OLI_PASSWORD` | Two different private passwords for the initial accounts on first setup |
 | `APP_ORIGIN` | The exact public HTTPS origin, without a trailing path |
 | `COOKIE_SECURE` | `true` |
 | `BIND_ADDRESS` | Server LAN IP when the reverse proxy is on another machine; otherwise `127.0.0.1` |
@@ -35,7 +37,9 @@ Set these `.env` values for your deployment:
 
 Forward your HTTPS reverse proxy to the configured host port. The container serves both the frontend and API on port 8000. Use a persistent named volume or a writable data directory owned by container UID/GID `10001:10001`.
 
-Changing one player's password and recreating the container invalidates that player's existing sessions while preserving their competitions and scores.
+Manage passwords in **Administration** after the first setup. Resetting a password or deactivating an account invalidates that player's sessions while preserving competitions and scores. Resetting your own password signs you out. The environment passwords only initialize a new database; changing them does not overwrite existing accounts or undo password resets.
+
+Existing installations migrate automatically, keeping Lukas and Oli's passwords and competition history. Both remain assigned to every pre-migration competition. Back up your database before upgrading.
 
 ## Published images
 
@@ -76,7 +80,7 @@ npm run build
 
 For development, export `LUKAS_PASSWORD`, `OLI_PASSWORD`, and `APP_ORIGIN=http://localhost:5173` in your shell. Start `.venv/bin/uvicorn backend.app:app --reload` from the repository root, and `npm run dev` from `frontend/`. Vite proxies API requests to port 8000.
 
-The disposable container smoke test checks the built frontend, login, scoring, archives, and persistence after container recreation:
+The disposable container smoke test checks the built frontend, login, user management, participant isolation, scoring, archives, and persistence after container recreation:
 
 ```sh
 docker build -t soulkeeper:local .

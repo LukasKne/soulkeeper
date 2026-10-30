@@ -1,19 +1,20 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
-import { api } from './api'
+import { api, ApiError } from './api'
+import Admin from './Admin'
+import Modal from './Modal'
 import type { AttemptStatus, AttemptView, Competition, CompetitionList, Encounter, Leaderboard, Session, Username } from './types'
 
 const anonymous: Session = { user: null, csrf_token: null }
 const emptyCompetitions: CompetitionList = { competitions: [], current_id: 0 }
 type Route = { id: number | null; manage: boolean }
-type Dialog = 'login' | 'failed' | 'completed' | 'create' | null
+type Dialog = 'login' | 'failed' | 'completed' | null
 
 function readRoute(): Route {
   const match = window.location.pathname.match(/^\/competitions\/(\d+)\/?$/)
-  return { id: match ? Number(match[1]) : null, manage: window.location.pathname === '/manage' }
+  return { id: match ? Number(match[1]) : null, manage: ['/admin', '/manage'].includes(window.location.pathname) }
 }
 function titleCase(value: string) { return value.charAt(0).toUpperCase() + value.slice(1) }
-function date(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(value)) }
 function isAborted(error: unknown) { return error instanceof DOMException && error.name === 'AbortError' }
 function errorMessage(error: unknown) { return error instanceof Error ? error.message : 'Something went wrong. Please try again.' }
 
@@ -40,39 +41,6 @@ function Status({ value }: { value: AttemptStatus }) {
   return <span className={`life-status ${value}`}><span className="status-dot"/>{labels[value]}</span>
 }
 
-function Modal({ title, children, onClose, busy }: { title: string; children: ReactNode; onClose: () => void; busy: boolean }) {
-  const id = useId()
-  const ref = useRef<HTMLDivElement>(null)
-  const closeRef = useRef(onClose)
-  const busyRef = useRef(busy)
-  closeRef.current = onClose
-  busyRef.current = busy
-  useEffect(() => {
-    const prior = document.activeElement as HTMLElement | null
-    const bodyOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    ref.current?.querySelector<HTMLElement>('input, select, button')?.focus()
-    const handler = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !busyRef.current) closeRef.current()
-      if (event.key !== 'Tab') return
-      const items = ref.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]')
-      if (!items?.length) { event.preventDefault(); return }
-      const first = items[0], last = items[items.length - 1]
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
-    }
-    document.addEventListener('keydown', handler)
-    return () => { document.body.style.overflow = bodyOverflow; document.removeEventListener('keydown', handler); prior?.focus() }
-  }, [])
-  return <div className="modal-backdrop" onClick={event => { if (event.target === event.currentTarget && !busy) onClose() }}>
-    <div className="modal" role="dialog" aria-modal="true" aria-labelledby={id} ref={ref}>
-      <button className="icon-button modal-close" aria-label="Close dialog" disabled={busy} onClick={onClose}><Icon name="close"/></button>
-      <div className="modal-emblem"><Icon name={title === 'Enter the ledger' ? 'shield' : 'flame'} size={28}/></div>
-      <h2 id={id}>{title}</h2>{children}
-    </div>
-  </div>
-}
-
 export default function App() {
   const [route, setRoute] = useState<Route>(readRoute)
   const routeRef = useRef(route); routeRef.current = route
@@ -83,6 +51,8 @@ export default function App() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [operationError, setOperationError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [unassigned, setUnassigned] = useState(false)
   const [dialog, setDialog] = useState<Dialog>(null)
   const [dialogError, setDialogError] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
@@ -100,7 +70,7 @@ export default function App() {
   const navigate = useCallback((path: string) => {
     invalidateReads()
     window.history.pushState({}, '', path)
-    setRoute(readRoute()); setBoard(null); setOwn(null); setError(''); setOperationError(''); setLoading(true)
+    setRoute(readRoute()); setBoard(null); setOwn(null); setUnassigned(false); setError(''); setOperationError(''); setLoading(true)
     window.scrollTo({ top: 0, behavior: 'instant' })
   }, [invalidateReads])
 
@@ -114,12 +84,18 @@ export default function App() {
     try {
       const [nextSession, list] = await Promise.all([api<Session>('/session', { signal }), api<CompetitionList>('/competitions', { signal })])
       const id = scope.id ?? list.current_id
-      const [nextBoard, nextOwn] = await Promise.all([
+      const [nextBoard, assignment] = await Promise.all([
         scope.manage ? Promise.resolve(null) : api<Leaderboard>(`/competitions/${id}/leaderboard`, { signal }),
-        nextSession.user && !scope.manage ? api<AttemptView>(`/competitions/${id}/attempt`, { signal }) : Promise.resolve(null),
+        nextSession.user && !scope.manage ? api<AttemptView>(`/competitions/${id}/attempt`, { signal }).then(view => ({ view, unassigned: false })).catch(err => {
+          if (err instanceof ApiError && err.status === 403) {
+            if (sequence === readSequence.current) { setOwn(null); setUnassigned(true) }
+            return { view: null, unassigned: true }
+          }
+          throw err
+        }) : Promise.resolve({ view: null, unassigned: false }),
       ])
       if (sequence !== readSequence.current) return
-      setSession(nextSession); setCompetitions(list); setBoard(nextBoard); setOwn(nextOwn); setError('')
+      setSession(nextSession); setCompetitions(list); setBoard(nextBoard); setOwn(assignment.view); setUnassigned(assignment.unassigned); setError('')
       if (!scope.manage && scope.id === null) {
         window.history.replaceState({}, '', `/competitions/${id}`)
         const pinned = { id, manage: false }; routeRef.current = pinned; setRoute(pinned)
@@ -131,7 +107,7 @@ export default function App() {
 
   useEffect(() => {
     void refresh()
-    const pop = () => { invalidateReads(); setRoute(readRoute()); setBoard(null); setOwn(null); setLoading(true); setError(''); setOperationError('') }
+    const pop = () => { invalidateReads(); setRoute(readRoute()); setBoard(null); setOwn(null); setUnassigned(false); setLoading(true); setError(''); setOperationError('') }
     window.addEventListener('popstate', pop)
     return () => { window.removeEventListener('popstate', pop); invalidateReads() }
   }, [refresh, invalidateReads])
@@ -164,7 +140,7 @@ export default function App() {
 
   const beginMutation = (key: string) => {
     if (busyRef.current) return false
-    busyRef.current = true; setBusy(key); setError(''); setOperationError(''); setDialogError(''); invalidateReads(); return true
+    busyRef.current = true; setBusy(key); setNotice(''); setError(''); setOperationError(''); setDialogError(''); invalidateReads(); return true
   }
   const finishMutation = async () => { invalidateReads(); busyRef.current = false; setBusy(null); setPendingCheck(null); await refresh() }
   const openDialog = (value: Dialog) => { setDialogError(''); setPassword(''); setDialog(value) }
@@ -204,10 +180,7 @@ export default function App() {
     const id = competition?.id
     if (!action || action === 'login' || !beginMutation(action)) return
     try {
-      if (action === 'create') {
-        const next = await api<{ competition: Competition; current_id: number }>('/competitions', { method: 'POST', body: { expected_current_id: competitions.current_id }, csrf: session.csrf_token })
-        setDialog(null); navigate(`/competitions/${next.competition.id}`)
-      } else if (id) {
+      if (id) {
         const next = await api<AttemptView>(`/competitions/${id}/attempt/finish`, { method: 'POST', body: { outcome: action }, csrf: session.csrf_token })
         if (routeRef.current.id === id) setOwn(next)
         setDialog(null)
@@ -222,8 +195,8 @@ export default function App() {
         <a href="/" className="brand" onClick={event => { event.preventDefault(); navigate('/') }}><span className="brand-mark"><Icon name="flame" size={27}/></span><span>SOULKEEPER<span className="brand-sub">DARK SOULS REMASTERED</span></span></a>
         <nav aria-label="Main navigation">
           <a href={route.manage ? '/' : '#leaderboard'} className={!route.manage ? 'nav-link active' : 'nav-link'} onClick={event => { if (route.manage) { event.preventDefault(); navigate('/') } }}>Leaderboard</a>
-          {session.user && <a href={route.manage ? '/' : '#my-run'} className="nav-link" onClick={event => { if (route.manage) { event.preventDefault(); navigate('/') } }}>My run</a>}
-          {session.user?.can_manage && <a href="/manage" className={route.manage ? 'nav-link active' : 'nav-link'} onClick={event => { event.preventDefault(); navigate('/manage') }}>Manage competitions</a>}
+          {session.user && !unassigned && <a href={route.manage ? '/' : '#my-run'} className="nav-link" onClick={event => { if (route.manage) { event.preventDefault(); navigate('/') } }}>My run</a>}
+          {session.user?.can_manage && <a href="/admin" className={route.manage ? 'nav-link active' : 'nav-link'} onClick={event => { event.preventDefault(); navigate('/admin') }}>Admin</a>}
         </nav>
         {session.user ? <div className="account"><span className="account-avatar">{session.user.username[0].toUpperCase()}</span><span className="account-name">{titleCase(session.user.username)}</span><button className="icon-button" onClick={() => void logout()} aria-label="Log out" disabled={Boolean(busy)}><Icon name="logout" size={18}/></button></div> : <button className="button button-small button-outline" onClick={() => openDialog('login')}><Icon name="lock" size={14}/>Player login</button>}
       </div>
@@ -231,25 +204,26 @@ export default function App() {
 
     <main className="shell">
       <section className="hero">
-        <div className="hero-copy"><p className="eyebrow"><span className="gold-line"/>THE NO-DEATH CHRONICLES</p><h1>{route.manage ? <>Every run deserves<br/><em>to be remembered.</em></> : <>One life.<br/><em>Make it count.</em></>}</h1><p className="hero-description">Two challengers. One unforgiving world.<br className="desktop-break"/> Every victory recorded. Every fallen run remembered.</p></div>
+        <div className="hero-copy"><p className="eyebrow"><span className="gold-line"/>THE NO-DEATH CHRONICLES</p><h1>{route.manage ? <>Every run deserves<br/><em>to be remembered.</em></> : <>One life.<br/><em>Make it count.</em></>}</h1><p className="hero-description">A shared challenge. One unforgiving world.<br className="desktop-break"/> Every victory recorded. Every fallen run remembered.</p></div>
         <div className="hero-art" aria-hidden="true"><div className="art-ring art-ring-one"/><div className="art-ring art-ring-two"/><div className="art-ring art-ring-three"/><svg viewBox="0 0 280 280" className="bonfire"><defs><linearGradient id="ember" x1="0" y1="1" x2="1" y2="0"><stop stopColor="#6a4a26"/><stop offset=".55" stopColor="#d0b27b"/><stop offset="1" stopColor="#f2dbac"/></linearGradient></defs><g fill="none" stroke="url(#ember)" strokeLinecap="round" strokeLinejoin="round"><path className="bonfire-glow" d="M143 42v156m-9-142 9-14 9 14m-22 68 27-5m-14 5-2 73m-31-3 66 32m-63 0 66-32m-75 22 78 25m-74 0 73-25" strokeWidth="3"/><path d="M132 194c-25-20-31-41-16-68-2 21 4 27 12 32-8-32 17-40 21-61 15 27 3 42 13 59 5-6 8-14 7-24 28 37 15 62-10 71" strokeWidth="1.4" opacity=".65"/></g><g fill="#c5a466"><circle cx="101" cy="103" r="1.5"/><circle cx="171" cy="82" r="2"/><circle cx="184" cy="130" r="1.3"/><circle cx="117" cy="73" r="1"/><circle cx="158" cy="51" r="1.5"/></g></svg><span className="art-caption">DON’T YOU DARE GO HOLLOW.</span></div>
       </section>
 
       {(error || operationError) && <div className="error-banner" role="alert"><span>{operationError || error}</span><button onClick={() => { if (operationError) setOperationError(''); else void refresh() }} className="text-button">{operationError ? 'Dismiss' : 'Retry'}</button></div>}
 
-      {route.manage ? <section className="management" aria-labelledby="manage-title">
-        <div className="section-heading"><div><p className="eyebrow">THE LEDGER</p><h2 id="manage-title">Manage competitions</h2></div>{session.user?.can_manage && <button className="button button-gold" onClick={() => openDialog('create')} disabled={Boolean(busy) || !current}>Create next competition<Icon name="arrow" size={17}/></button>}</div>
-        {!session.user ? <div className="empty-panel"><Icon name="lock" size={26}/><h3>A keeper’s responsibility.</h3><p>Log in as Lukas to create the next competition.</p><button className="button button-gold" onClick={() => openDialog('login')}>Player login</button></div> : !session.user.can_manage ? <div className="empty-panel"><h3>Only Lukas can open a new competition.</h3><p>Your run is waiting on the leaderboard.</p><button className="button button-outline" onClick={() => navigate('/')}>Return to leaderboard</button></div> : <><p className="section-description">A new competition opens a fresh leaderboard for both players. All previous scores, life statuses, and checklists stay in the archive.</p><div className="competition-history">{competitions.competitions.map(item => <a className="history-row" key={item.id} href={`/competitions/${item.id}`} onClick={event => { event.preventDefault(); navigate(`/competitions/${item.id}`) }}><span className="history-number">{String(item.number).padStart(2, '0')}</span><div><h3>{item.name}</h3><span>Opened {date(item.created_at)}{item.archived_at ? ` · Archived ${date(item.archived_at)}` : ''}</span></div><span className={`chapter-badge ${item.status}`}>{item.status === 'current' ? 'Current' : 'Archived'}</span><Icon name="arrow" size={20}/></a>)}</div></>}
-      </section> : <>
+      {notice && <div className="success-banner" role="status">{notice}</div>}
+      {route.manage ? <Admin session={session} competitions={competitions} navigate={navigate} onLogin={() => openDialog('login')} onSessionInvalidated={text => {
+        invalidateReads(); setSession(anonymous); setOwn(null); setUnassigned(false); setNotice(text); void refresh()
+      }}/> : <>
         <section className="competition-toolbar" aria-label="Competition selection"><div className="chapter-label"><span className="chapter-number">{String(competition?.number ?? 1).padStart(2, '0')}</span><div><span className="eyebrow">{archived ? 'FROM THE ARCHIVES' : 'THE CURRENT CHAPTER'}</span><h2>{competition?.name ?? 'The ledger'}</h2></div></div><div className="competition-picker"><label htmlFor="competition-select">Browse competitions</label><div className="select-wrap"><select id="competition-select" value={competition?.id ?? ''} disabled={!competitions.competitions.length} onChange={event => navigate(`/competitions/${event.target.value}`)}>{!competitions.competitions.length && <option value="">Loading competitions…</option>}{competitions.competitions.map(item => <option key={item.id} value={item.id}>{item.name} · {item.status === 'current' ? 'Current' : 'Archived'}</option>)}</select><Icon name="chevron" size={16}/></div></div></section>
 
         {archived && <div className="archive-banner"><Icon name="archive" size={21}/><div><strong>This chapter is preserved.</strong><span>Scores and life statuses are final. This competition and your checklist are read-only.</span></div>{current && <button className="text-button" onClick={() => navigate(`/competitions/${current.id}`)}>View current competition<Icon name="arrow" size={15}/></button>}</div>}
 
         <section className="leaderboard-section" id="leaderboard" aria-labelledby="leaderboard-title"><div className="section-heading"><div><p className="eyebrow">THE STANDINGS</p><h2 id="leaderboard-title">The challengers</h2></div><span className="live-label"><span className={archived ? 'quiet-dot' : 'live-dot'}/>{archived ? 'Archived leaderboard' : 'Live · updates every 5s'}</span></div>
-          {loading && !board ? <div className="loading-panel" role="status">Opening the ledger…</div> : board ? <div className="challengers">{board.players.map(player => <article className={`challenger-card ${player.attempt_status} ${session.user?.username === player.username ? 'is-you' : ''}`} key={player.username}><div className="challenger-top"><span className="challenger-rank">{player.attempt_status === 'not_started' ? '—' : `0${player.rank}`}<span>RANK</span></span><Status value={player.attempt_status}/></div><div className="challenger-identity"><div className={`player-emblem ${player.username}`}><span>{player.username[0].toUpperCase()}</span><Icon name={player.username === 'lukas' ? 'sword' : 'shield'} size={28}/></div><div><span className="eyebrow">CHOSEN UNDEAD{session.user?.username === player.username ? ' · YOU' : ''}</span><h3>{titleCase(player.username)}</h3></div></div><div className="player-score"><strong>{player.points}</strong><span>/ {maxPoints}<br/>POINTS</span><span className="score-ornament">✦</span></div><div className="score-track" role="progressbar" aria-label={`${titleCase(player.username)} score`} aria-valuemin={0} aria-valuemax={maxPoints} aria-valuenow={player.points}><span style={{ width: `${Math.min(100, player.points / maxPoints * 100)}%` }}/></div><div className="player-breakdown"><span><Icon name="crown" size={16}/><strong>{player.bosses_defeated}</strong> bosses</span><span><Icon name="sword" size={16}/><strong>{player.minibosses_defeated}</strong> minibosses</span></div></article>)}</div> : !error && <div className="loading-panel">No leaderboard available.</div>}
+          {loading && !board ? <div className="loading-panel" role="status">Opening the ledger…</div> : board ? <div className="challengers">{board.players.map(player => <article className={`challenger-card ${player.attempt_status} ${session.user?.username === player.username ? 'is-you' : ''}`} key={player.username}><div className="challenger-top"><span className="challenger-rank">{player.attempt_status === 'not_started' ? '—' : String(player.rank).padStart(2, '0')}<span>RANK</span></span><Status value={player.attempt_status}/></div><div className="challenger-identity"><div className="player-emblem"><span>{player.username[0].toUpperCase()}</span><Icon name="shield" size={28}/></div><div><span className="eyebrow">CHOSEN UNDEAD{session.user?.username === player.username ? ' · YOU' : ''}</span><h3>{titleCase(player.username)}</h3></div></div><div className="player-score"><strong>{player.points}</strong><span>/ {maxPoints}<br/>POINTS</span><span className="score-ornament">✦</span></div><div className="score-track" role="progressbar" aria-label={`${titleCase(player.username)} score`} aria-valuemin={0} aria-valuemax={maxPoints} aria-valuenow={player.points}><span style={{ width: `${Math.min(100, player.points / maxPoints * 100)}%` }}/></div><div className="player-breakdown"><span><Icon name="crown" size={16}/><strong>{player.bosses_defeated}</strong> bosses</span><span><Icon name="sword" size={16}/><strong>{player.minibosses_defeated}</strong> minibosses</span></div></article>)}</div> : !error && <div className="loading-panel">No leaderboard available.</div>}
           <div className="scoring-note"><span><span className="point-lozenge">5</span>per boss encounter</span><span><span className="point-lozenge mini">3</span>per miniboss</span><span className="scoring-total">26 bosses · 60 minibosses · one life per competition</span></div>
         </section>
 
+        {session.user && unassigned && <section className="empty-panel unassigned-panel" id="my-run"><h2>You are not assigned to this competition.</h2><p>You can still follow the public leaderboard. Ask Lukas to add you to a current competition.</p></section>}
         {session.user && own ? <section className="run-section" id="my-run" aria-labelledby="run-title"><div className="section-heading"><div><p className="eyebrow">YOUR JOURNEY</p><h2 id="run-title">{titleCase(session.user.username)}’s field ledger</h2></div><span className="run-tag">{competition?.name}</span></div>
           <div className="personal-summary"><div className="personal-points"><Icon name="flame" size={25}/><strong>{points}</strong><span>POINTS</span><span className="summary-divider"/><Status value={own.attempt?.status ?? 'not_started'}/></div><div className="run-actions">{archived ? <span className="read-only-label"><Icon name="lock" size={15}/>Archived · Read-only</span> : !own.attempt ? <button className="button button-gold" onClick={() => void startAttempt()} disabled={Boolean(busy)}>{busy === 'start' ? 'Starting…' : 'Start my attempt'}<Icon name="arrow" size={17}/></button> : editable ? <><span className="save-state" role="status">{busy && pendingCheck ? 'Saving…' : 'Progress saved automatically'}</span><button className="button button-outline button-small" onClick={() => openDialog('completed')} disabled={Boolean(busy)}>Finish run</button><button className="button button-danger button-small" onClick={() => openDialog('failed')} disabled={Boolean(busy)}>I died</button></> : <span className="read-only-label"><Icon name="lock" size={15}/>Attempt ended · Read-only</span>}</div></div>
           {!own.attempt && !archived && <p className="attempt-intro">Your one attempt is waiting. Start when you enter Lordran; then mark each encounter as you defeat it.</p>}
@@ -262,7 +236,7 @@ export default function App() {
       <footer className="site-footer"><a className="footer-brand" href="/" onClick={event => { event.preventDefault(); navigate('/') }}><Icon name="flame" size={18}/>SOULKEEPER</a><span>A ledger for the chosen undead.</span><span>Vanilla + Artorias of the Abyss</span></footer>
     </main>
 
-    {dialog === 'login' && <Modal title="Enter the ledger" onClose={() => setDialog(null)} busy={Boolean(busy)}><p className="modal-description">Your victories, your one chance.<br/>Choose your player to continue.</p><form onSubmit={event => void login(event)}><label className="form-label" htmlFor="player-name">Player</label><select className="form-input" id="player-name" value={username} onChange={event => setUsername(event.target.value as Username)} disabled={Boolean(busy)}><option value="lukas">Lukas</option><option value="oli">Oli</option></select><label className="form-label" htmlFor="player-password">Password</label><input className="form-input" id="player-password" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required disabled={Boolean(busy)}/>{dialogError && <p role="alert" className="form-error">{dialogError}</p>}<button className="button button-gold modal-submit" type="submit" disabled={Boolean(busy) || !password}>{busy === 'login' ? 'Entering…' : 'Enter the ledger'}<Icon name="arrow" size={17}/></button></form></Modal>}
-    {dialog && dialog !== 'login' && <Modal title={dialog === 'create' ? 'Open a new chapter?' : dialog === 'failed' ? 'Has your journey ended?' : 'Complete your journey?'} onClose={() => setDialog(null)} busy={Boolean(busy)}><p className="modal-description">{dialog === 'create' ? `${current?.name ?? 'The current competition'} will be archived and both players will receive a fresh attempt in Competition ${(current?.number ?? 0) + 1}. All old scores, life statuses, and checklists will stay visible and read-only.` : dialog === 'failed' ? `This marks you as Dead with ${points} points. Your checklist will be permanently locked for this competition. Your recorded victories will be preserved.` : `This saves your final score of ${points} points and marks your attempt completed. You remain Alive, and your checklist will be permanently locked for this competition.`}</p>{dialogError && <p role="alert" className="form-error">{dialogError}</p>}<div className="modal-actions"><button className="button button-outline" onClick={() => setDialog(null)} disabled={Boolean(busy)}>Cancel</button><button className={`button ${dialog === 'failed' ? 'button-danger-solid' : 'button-gold'}`} onClick={() => void confirm()} disabled={Boolean(busy) || (dialog !== 'create' && !editable)}>{busy ? 'Saving…' : dialog === 'create' ? 'Create next competition' : dialog === 'failed' ? 'Confirm death' : 'Complete run'}</button></div></Modal>}
+    {dialog === 'login' && <Modal title="Enter the ledger" onClose={() => setDialog(null)} busy={Boolean(busy)}><p className="modal-description">Your victories, your one chance.<br/>Log in to your player account to continue.</p><form onSubmit={event => void login(event)}><label className="form-label" htmlFor="player-name">Username</label><input className="form-input" id="player-name" value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" autoCapitalize="none" spellCheck={false} required disabled={Boolean(busy)}/><label className="form-label" htmlFor="player-password">Password</label><input className="form-input" id="player-password" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required disabled={Boolean(busy)}/>{dialogError && <p role="alert" className="form-error">{dialogError}</p>}<button className="button button-gold modal-submit" type="submit" disabled={Boolean(busy) || !password}>{busy === 'login' ? 'Entering…' : 'Enter the ledger'}<Icon name="arrow" size={17}/></button></form></Modal>}
+    {dialog && dialog !== 'login' && <Modal title={dialog === 'failed' ? 'Has your journey ended?' : 'Complete your journey?'} onClose={() => setDialog(null)} busy={Boolean(busy)}><p className="modal-description">{dialog === 'failed' ? `This marks you as Dead with ${points} points. Your checklist will be permanently locked for this competition. Your recorded victories will be preserved.` : `This saves your final score of ${points} points and marks your attempt completed. You remain Alive, and your checklist will be permanently locked for this competition.`}</p>{dialogError && <p role="alert" className="form-error">{dialogError}</p>}<div className="modal-actions"><button className="button button-outline" onClick={() => setDialog(null)} disabled={Boolean(busy)}>Cancel</button><button className={`button ${dialog === 'failed' ? 'button-danger-solid' : 'button-gold'}`} onClick={() => void confirm()} disabled={Boolean(busy) || !editable}>{busy ? 'Saving…' : dialog === 'failed' ? 'Confirm death' : 'Complete run'}</button></div></Modal>}
   </>
 }

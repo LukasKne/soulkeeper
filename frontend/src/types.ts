@@ -1,4 +1,5 @@
-export type Username = 'lukas' | 'oli'
+export type Username = string
+export type AdminUser = { username: Username; active: boolean; can_manage: boolean }
 export type AttemptStatus = 'not_started' | 'active' | 'failed' | 'completed'
 export type Competition = {
   id: number

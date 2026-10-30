@@ -576,3 +576,130 @@ def test_v1_migration_preserves_realistic_history_passwords_and_sessions(setup, 
         restarted.cookies.set(COOKIE_NAME, legacy_token)
         assert restarted.get("/api/session").json()["user"]["username"] == "lukas"
         assert restarted.get("/api/competitions/2/attempt").json()["attempt"]["points"] == 3
+
+
+def change_own_password(client, headers, current_password=PASSWORDS["oli"], new_password="oli-changed-test-password"):
+    return client.post("/api/account/password", json={"current_password": current_password, "new_password": new_password}, headers=headers)
+
+
+def test_player_changes_own_password_revokes_all_own_sessions_and_preserves_results(setup):
+    settings, catalog = setup
+    application = create_app(settings, catalog)
+    with TestClient(application) as lukas:
+        lukas_headers = sign_in(lukas)
+        start(lukas, lukas_headers)
+        check(lukas, lukas_headers, "miniboss")
+        oli = TestClient(application)
+        oli_headers = sign_in(oli, "oli")
+        other_oli = TestClient(application)
+        sign_in(other_oli, "oli")
+        start(oli, oli_headers)
+        check(oli, oli_headers)
+        before_board = lukas.get("/api/competitions/1/leaderboard").json()
+        with application.state.db.connect() as connection:
+            before_users = {row["username"]: tuple(row) for row in connection.execute("SELECT * FROM users")}
+        result = change_own_password(oli, oli_headers)
+        assert result.status_code == 200
+        assert result.json() == {"user": None, "csrf_token": None}
+        assert "Max-Age=0" in result.headers["set-cookie"]
+        assert COOKIE_NAME not in oli.cookies
+        assert other_oli.get("/api/session").json()["user"] is None
+        assert oli.get("/api/competitions/1/attempt").status_code == 401
+        assert lukas.get("/api/session").json()["user"]["username"] == "lukas"
+        assert lukas.get("/api/competitions/1/leaderboard").json() == before_board
+        with application.state.db.connect() as connection:
+            after_users = {row["username"]: tuple(row) for row in connection.execute("SELECT * FROM users")}
+            assert before_users["lukas"] == after_users["lukas"]
+            assert before_users["oli"][1:3] != after_users["oli"][1:3]
+            assert after_users["oli"][-1] == before_users["oli"][-1] + 1
+            assert connection.execute("SELECT COUNT(*) FROM sessions WHERE username='oli'").fetchone()[0] == 0
+        assert oli.post("/api/login", json={"username": "oli", "password": PASSWORDS["oli"]}).status_code == 401
+        sign_in(oli, "oli", "oli-changed-test-password")
+        assert oli.get("/api/competitions/1/attempt").json()["attempt"]["points"] == 5
+    with TestClient(create_app(settings, catalog)) as restarted:
+        sign_in(restarted, "oli", "oli-changed-test-password")
+        assert restarted.get("/api/competitions/1/attempt").json()["attempt"]["points"] == 5
+        assert restarted.get("/api/competitions/1/leaderboard").json() == before_board
+
+
+def test_self_password_change_requires_session_csrf_origin_and_has_no_username_override(app):
+    application, client = app
+    assert change_own_password(client, {}).status_code == 401
+    oli = TestClient(application)
+    headers = sign_in(oli, "oli")
+    assert change_own_password(oli, {}).status_code == 403
+    assert change_own_password(oli, {**headers, "Origin": "https://evil.example"}).status_code == 403
+    assert oli.post("/api/account/password", json={"current_password": PASSWORDS["oli"], "new_password": "oli-changed-test-password", "username": "lukas"}, headers=headers).status_code == 422
+    assert oli.get("/api/session").json()["user"]["username"] == "oli"
+    sign_in(client, "lukas")
+
+
+@pytest.mark.parametrize("current,new,status", [
+    ("wrong-current", "oli-changed-test-password", 401),
+    (PASSWORDS["oli"], PASSWORDS["oli"], 422),
+    (PASSWORDS["oli"], "short", 422),
+    (PASSWORDS["oli"], "x" * 1025, 422),
+    ("", "oli-changed-test-password", 422),
+    ("x" * 1025, "oli-changed-test-password", 422),
+])
+def test_rejected_self_password_changes_keep_credentials_and_sessions(app, current, new, status):
+    application, client = app
+    headers = sign_in(client, "oli")
+    with application.state.db.connect() as connection:
+        before = tuple(connection.execute("SELECT * FROM users WHERE username='oli'").fetchone())
+    assert change_own_password(client, headers, current, new).status_code == status
+    assert client.get("/api/session").json()["user"]["username"] == "oli"
+    with application.state.db.connect() as connection:
+        assert tuple(connection.execute("SELECT * FROM users WHERE username='oli'").fetchone()) == before
+    sign_in(client, "oli")
+
+
+def test_current_password_guess_throttle_is_per_username_across_sessions(app):
+    application, client = app
+    oli_headers = sign_in(client, "oli")
+    other_oli = TestClient(application)
+    other_headers = sign_in(other_oli, "oli")
+    for index in range(5):
+        selected, headers = (client, oli_headers) if index % 2 else (other_oli, other_headers)
+        assert change_own_password(selected, headers, "wrong-current").status_code == 401
+    blocked = change_own_password(client, oli_headers)
+    assert blocked.status_code == 429 and blocked.headers["retry-after"] == "60"
+    assert client.get("/api/session").json()["user"]["username"] == "oli"
+    lukas = TestClient(application)
+    lukas_headers = sign_in(lukas)
+    assert change_own_password(lukas, lukas_headers, "wrong-current").status_code == 401
+    with application.state.login_lock:
+        expired = application.state.password_failures["oli"]
+        for index in range(len(expired)):
+            expired[index] -= 61
+    assert change_own_password(client, oli_headers).status_code == 200
+
+
+@pytest.mark.parametrize("change", ["admin_reset", "deactivate_reactivate"])
+def test_pending_self_password_change_cannot_overwrite_admin_account_change(app, monkeypatch, change):
+    application, lukas = app
+    lukas_headers = sign_in(lukas)
+    oli = TestClient(application)
+    oli_headers = sign_in(oli, "oli")
+    hashing, resume = threading.Event(), threading.Event()
+    original_hash = password_hash
+
+    def delayed_hash(password, salt):
+        if password == "oli-changed-test-password":
+            hashing.set()
+            assert resume.wait(5)
+        return original_hash(password, salt)
+
+    monkeypatch.setattr("backend.app.password_hash", delayed_hash)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(change_own_password, oli, oli_headers)
+        assert hashing.wait(5)
+        if change == "admin_reset":
+            assert lukas.patch("/api/admin/users/oli", json={"password": "admin-updated-oli-password"}, headers=lukas_headers).status_code == 200
+        else:
+            assert lukas.patch("/api/admin/users/oli", json={"active": False}, headers=lukas_headers).status_code == 200
+            assert lukas.patch("/api/admin/users/oli", json={"active": True}, headers=lukas_headers).status_code == 200
+        resume.set()
+        assert pending.result().status_code == 401
+    assert oli.get("/api/session").json()["user"] is None
+    sign_in(oli, "oli", "admin-updated-oli-password" if change == "admin_reset" else PASSWORDS["oli"])

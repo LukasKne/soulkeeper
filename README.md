@@ -4,6 +4,8 @@ A small Dark Souls Remastered no-death competition tracker. Public leaderboards 
 
 Lukas can manage players and competitions from **Administration** at `/admin`. Create accounts, reset passwords, and deactivate players while preserving their results. Usernames are permanent; there is no public registration.
 
+Every signed-in player can use **Change password** beside their account name. Enter the current password and confirm a new password of at least 12 characters. A successful change signs out that player's sessions; log in again with the new password. Scores and competition history are preserved.
+
 Create the next competition with a name and a selected group of active players. There is one current competition at a time. The previous competition stays visible in the selector, with its participants, leaderboard, and checklists preserved as read-only records. Each competition has a permanent URL. Participants can be added to the current competition; a player who has started an attempt cannot be removed.
 
 ## Run with Docker
@@ -37,7 +39,7 @@ Set these `.env` values for your deployment:
 
 Forward your HTTPS reverse proxy to the configured host port. The container serves both the frontend and API on port 8000. Use a persistent named volume or a writable data directory owned by container UID/GID `10001:10001`.
 
-Manage passwords in **Administration** after the first setup. Resetting a password or deactivating an account invalidates that player's sessions while preserving competitions and scores. Resetting your own password signs you out. The environment passwords only initialize a new database; changing them does not overwrite existing accounts or undo password resets.
+Players manage their own passwords through **Change password**. Lukas can also reset passwords in **Administration**. Changing or resetting a password, or deactivating an account, invalidates that player's sessions while preserving competitions and scores. The environment passwords only initialize a new database; changing them does not overwrite existing accounts or undo password changes.
 
 Existing installations migrate automatically, keeping Lukas and Oli's passwords and competition history. Both remain assigned to every pre-migration competition. Back up your database before upgrading.
 

@@ -8,7 +8,7 @@ import type { AttemptStatus, AttemptView, Competition, CompetitionList, Encounte
 const anonymous: Session = { user: null, csrf_token: null }
 const emptyCompetitions: CompetitionList = { competitions: [], current_id: 0 }
 type Route = { id: number | null; manage: boolean }
-type Dialog = 'login' | 'failed' | 'completed' | null
+type Dialog = 'login' | 'password' | 'failed' | 'completed' | null
 
 function readRoute(): Route {
   const match = window.location.pathname.match(/^\/competitions\/(\d+)\/?$/)
@@ -59,6 +59,10 @@ export default function App() {
   const [pendingCheck, setPendingCheck] = useState<{ id: string; defeated: boolean } | null>(null)
   const [username, setUsername] = useState<Username>('lukas')
   const [password, setPassword] = useState('')
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const passwordOwner = useRef<Username | null>(null)
   const [search, setSearch] = useState('')
   const [remaining, setRemaining] = useState(false)
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
@@ -120,6 +124,12 @@ export default function App() {
     return () => { window.clearInterval(timer); window.removeEventListener('focus', visibleRefresh); document.removeEventListener('visibilitychange', visibleRefresh) }
   }, [refresh])
 
+  useEffect(() => {
+    if (dialog === 'password' && session.user?.username !== passwordOwner.current) {
+      setDialog(null); setDialogError(''); setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+    }
+  }, [dialog, session.user?.username])
+
   const competition = board?.competition ?? own?.competition ?? competitions.competitions.find(c => c.id === route.id)
   const archived = competition?.status === 'archived'
   const editable = Boolean(session.user && own?.attempt?.status === 'active' && !archived)
@@ -143,7 +153,12 @@ export default function App() {
     busyRef.current = true; setBusy(key); setNotice(''); setError(''); setOperationError(''); setDialogError(''); invalidateReads(); return true
   }
   const finishMutation = async () => { invalidateReads(); busyRef.current = false; setBusy(null); setPendingCheck(null); await refresh() }
-  const openDialog = (value: Dialog) => { setDialogError(''); setPassword(''); setDialog(value) }
+  const closePasswordDialog = () => { setDialog(null); setDialogError(''); setCurrentPassword(''); setNewPassword(''); setConfirmPassword(''); passwordOwner.current = null }
+  const openDialog = (value: Dialog) => {
+    setDialogError(''); setPassword(''); setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+    passwordOwner.current = value === 'password' ? session.user?.username ?? null : null
+    setDialog(value)
+  }
 
   async function login(event: FormEvent) {
     event.preventDefault()
@@ -156,6 +171,19 @@ export default function App() {
     if (!beginMutation('logout')) return
     try { await api<Session>('/logout', { method: 'POST', csrf: session.csrf_token }); setSession(anonymous); setOwn(null); if (route.manage) navigate('/') }
     catch (err) { setOperationError(errorMessage(err)) }
+    finally { await finishMutation() }
+  }
+  async function changePassword(event: FormEvent) {
+    event.preventDefault()
+    if (!session.user || passwordOwner.current !== session.user.username) return
+    if (newPassword !== confirmPassword) { setDialogError('New passwords do not match.'); return }
+    if (!beginMutation('password')) return
+    try {
+      const next = await api<Session>('/account/password', { method: 'POST', csrf: session.csrf_token, body: { current_password: currentPassword, new_password: newPassword } })
+      setSession(next); setOwn(null); setUnassigned(false); closePasswordDialog()
+      setNotice('Password changed. Log in again with your new password.')
+      if (route.manage) navigate(`/competitions/${competitions.current_id}`)
+    } catch (err) { setDialogError(errorMessage(err)) }
     finally { await finishMutation() }
   }
   async function startAttempt() {
@@ -178,7 +206,7 @@ export default function App() {
   async function confirm() {
     const action = dialog
     const id = competition?.id
-    if (!action || action === 'login' || !beginMutation(action)) return
+    if ((action !== 'failed' && action !== 'completed') || !beginMutation(action)) return
     try {
       if (id) {
         const next = await api<AttemptView>(`/competitions/${id}/attempt/finish`, { method: 'POST', body: { outcome: action }, csrf: session.csrf_token })
@@ -198,7 +226,7 @@ export default function App() {
           {session.user && !unassigned && <a href={route.manage ? '/' : '#my-run'} className="nav-link" onClick={event => { if (route.manage) { event.preventDefault(); navigate('/') } }}>My run</a>}
           {session.user?.can_manage && <a href="/admin" className={route.manage ? 'nav-link active' : 'nav-link'} onClick={event => { event.preventDefault(); navigate('/admin') }}>Admin</a>}
         </nav>
-        {session.user ? <div className="account"><span className="account-avatar">{session.user.username[0].toUpperCase()}</span><span className="account-name">{titleCase(session.user.username)}</span><button className="icon-button" onClick={() => void logout()} aria-label="Log out" disabled={Boolean(busy)}><Icon name="logout" size={18}/></button></div> : <button className="button button-small button-outline" onClick={() => openDialog('login')}><Icon name="lock" size={14}/>Player login</button>}
+        {session.user ? <div className="account"><span className="account-avatar">{session.user.username[0].toUpperCase()}</span><span className="account-name">{titleCase(session.user.username)}</span><button className="account-password" onClick={() => openDialog('password')} aria-label="Change password" title="Change password" disabled={Boolean(busy)}><Icon name="lock" size={15}/><span>Change password</span></button><button className="icon-button" onClick={() => void logout()} aria-label="Log out" disabled={Boolean(busy)}><Icon name="logout" size={18}/></button></div> : <button className="button button-small button-outline" onClick={() => openDialog('login')}><Icon name="lock" size={14}/>Player login</button>}
       </div>
     </header>
 
@@ -237,6 +265,7 @@ export default function App() {
     </main>
 
     {dialog === 'login' && <Modal title="Enter the ledger" onClose={() => setDialog(null)} busy={Boolean(busy)}><p className="modal-description">Your victories, your one chance.<br/>Log in to your player account to continue.</p><form onSubmit={event => void login(event)}><label className="form-label" htmlFor="player-name">Username</label><input className="form-input" id="player-name" value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" autoCapitalize="none" spellCheck={false} required disabled={Boolean(busy)}/><label className="form-label" htmlFor="player-password">Password</label><input className="form-input" id="player-password" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required disabled={Boolean(busy)}/>{dialogError && <p role="alert" className="form-error">{dialogError}</p>}<button className="button button-gold modal-submit" type="submit" disabled={Boolean(busy) || !password}>{busy === 'login' ? 'Entering…' : 'Enter the ledger'}<Icon name="arrow" size={17}/></button></form></Modal>}
-    {dialog && dialog !== 'login' && <Modal title={dialog === 'failed' ? 'Has your journey ended?' : 'Complete your journey?'} onClose={() => setDialog(null)} busy={Boolean(busy)}><p className="modal-description">{dialog === 'failed' ? `This marks you as Dead with ${points} points. Your checklist will be permanently locked for this competition. Your recorded victories will be preserved.` : `This saves your final score of ${points} points and marks your attempt completed. You remain Alive, and your checklist will be permanently locked for this competition.`}</p>{dialogError && <p role="alert" className="form-error">{dialogError}</p>}<div className="modal-actions"><button className="button button-outline" onClick={() => setDialog(null)} disabled={Boolean(busy)}>Cancel</button><button className={`button ${dialog === 'failed' ? 'button-danger-solid' : 'button-gold'}`} onClick={() => void confirm()} disabled={Boolean(busy) || !editable}>{busy ? 'Saving…' : dialog === 'failed' ? 'Confirm death' : 'Complete run'}</button></div></Modal>}
+    {dialog === 'password' && session.user && <Modal title="Change password" onClose={closePasswordDialog} busy={Boolean(busy)}><p className="modal-description">Choose a password with at least 12 characters. You’ll be signed out on all devices after changing it.</p><form onSubmit={event => void changePassword(event)}><label className="form-label" htmlFor="account-current-password">Current password</label><input className="form-input" id="account-current-password" type="password" autoComplete="current-password" maxLength={1024} required value={currentPassword} onChange={event => setCurrentPassword(event.target.value)} disabled={Boolean(busy)}/><label className="form-label" htmlFor="account-new-password">New password</label><input className="form-input" id="account-new-password" type="password" autoComplete="new-password" minLength={12} maxLength={1024} required value={newPassword} onChange={event => setNewPassword(event.target.value)} disabled={Boolean(busy)}/><label className="form-label" htmlFor="account-confirm-password">Confirm new password</label><input className="form-input" id="account-confirm-password" type="password" autoComplete="new-password" minLength={12} maxLength={1024} required value={confirmPassword} onChange={event => setConfirmPassword(event.target.value)} disabled={Boolean(busy)}/>{dialogError && <p className="form-error" role="alert">{dialogError}</p>}<button className="button button-gold modal-submit" type="submit" disabled={Boolean(busy) || !currentPassword || newPassword.length < 12 || !confirmPassword}>{busy === 'password' ? 'Changing…' : 'Change password'}</button></form></Modal>}
+    {(dialog === 'failed' || dialog === 'completed') && <Modal title={dialog === 'failed' ? 'Has your journey ended?' : 'Complete your journey?'} onClose={() => setDialog(null)} busy={Boolean(busy)}><p className="modal-description">{dialog === 'failed' ? `This marks you as Dead with ${points} points. Your checklist will be permanently locked for this competition. Your recorded victories will be preserved.` : `This saves your final score of ${points} points and marks your attempt completed. You remain Alive, and your checklist will be permanently locked for this competition.`}</p>{dialogError && <p role="alert" className="form-error">{dialogError}</p>}<div className="modal-actions"><button className="button button-outline" onClick={() => setDialog(null)} disabled={Boolean(busy)}>Cancel</button><button className={`button ${dialog === 'failed' ? 'button-danger-solid' : 'button-gold'}`} onClick={() => void confirm()} disabled={Boolean(busy) || !editable}>{busy ? 'Saving…' : dialog === 'failed' ? 'Confirm death' : 'Complete run'}</button></div></Modal>}
   </>
 }

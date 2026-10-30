@@ -13,6 +13,7 @@ function makeServer(initialUser: Username | null = null) {
   let saveFails = false
   let assigned = true
   const users: AdminUser[] = [{ username: 'lukas', active: true, can_manage: true }, { username: 'oli', active: true, can_manage: false }]
+  const passwords: Record<string, string> = { lukas: 'correct-password', oli: 'correct-password' }
   const participants: Record<number, string[]> = { 1: ['lukas', 'oli'], 2: ['lukas', 'oli'] }
   const writes: { path: string; body: unknown; csrf: string | undefined }[] = []
   const attempts: Record<number, AttemptView['attempt']> = {
@@ -29,17 +30,23 @@ function makeServer(initialUser: Username | null = null) {
     const body = options?.body ? JSON.parse(String(options.body)) : undefined
     if (method !== 'GET') writes.push({ path, body, csrf: (options?.headers as Record<string, string>)?.['X-CSRF-Token'] })
     if (path === '/session') return reply(session())
-    if (path === '/login') { if (body.password !== 'correct-password') return reply({ detail: 'Invalid credentials' }, 401); user = body.username; return reply(session()) }
+    if (path === '/login') { if (body.password !== (passwords[body.username] ?? 'correct-password')) return reply({ detail: 'Invalid credentials' }, 401); user = body.username; return reply(session()) }
     if (path === '/logout') { user = null; return reply(session()) }
+    if (path === '/account/password' && method === 'POST') {
+      if (!user) return reply({ detail: 'Authentication required.' }, 401)
+      if (body.current_password !== passwords[user]) return reply({ detail: 'Current password is incorrect.' }, 401)
+      passwords[user] = body.new_password; user = null; return reply(session())
+    }
     if (path === '/admin/users' && method === 'GET') return reply({ users })
     if (path === '/admin/users' && method === 'POST') {
       if (users.some(item => item.username === body.username)) return reply({ detail: 'That username already exists.' }, 409)
-      const next = { username: body.username, active: true, can_manage: false }; users.push(next); return reply({ user: next }, 201)
+      const next = { username: body.username, active: true, can_manage: false }; users.push(next); passwords[next.username] = body.password; return reply({ user: next }, 201)
     }
     const patch = path.match(/^\/admin\/users\/(.+)$/)
     if (patch && method === 'PATCH') {
       const account = users.find(item => item.username === patch[1])!
       if ('active' in body) account.active = body.active
+      if (body.password) passwords[account.username] = body.password
       if (body.password && account.username === user) user = null
       return reply({ user: account })
     }
@@ -79,7 +86,7 @@ function makeServer(initialUser: Username | null = null) {
     if (action === 'attempt/start') { attempts[id] = { status: 'active', points: 0, bosses_defeated: 0, minibosses_defeated: 0, started_at: '2026-10-29T12:00:00Z', ended_at: null }; return reply(own(id)) }
     return reply({ detail: 'Not found' }, 404)
   })
-  return { fetchMock, writes, failSaves: () => { saveFails = true }, removeAssignment: () => { assigned = false }, archiveCurrent: () => { competitions[0] = { ...competitions[0], status: 'archived' }; current += 1; competitions.unshift(makeCompetition(current, 'current')); attempts[current] = null; participants[current] = ['lukas', 'oli'] } }
+  return { fetchMock, writes, expireSession: () => { user = null }, failSaves: () => { saveFails = true }, removeAssignment: () => { assigned = false }, archiveCurrent: () => { competitions[0] = { ...competitions[0], status: 'archived' }; current += 1; competitions.unshift(makeCompetition(current, 'current')); attempts[current] = null; participants[current] = ['lukas', 'oli'] } }
 }
 
 beforeEach(() => { window.history.replaceState({}, '', '/'); vi.stubGlobal('scrollTo', vi.fn()) })
@@ -275,5 +282,93 @@ describe('Soulkeeper journeys', () => {
     await screen.findByText('You are not assigned to this competition.')
     expect(screen.getByRole('heading', { name: 'No Death Friday' })).toBeInTheDocument()
     expect(server.writes).toContainEqual({ path: '/competitions', body: { expected_current_id: 2, participants: ['oli'], name: 'No Death Friday' }, csrf: 'test-csrf-token' })
+  })
+
+  it('lets a nonadmin change their password, signs out, and logs back in without losing the selected competition', async () => {
+    const server = makeServer('oli'); vi.stubGlobal('fetch', server.fetchMock)
+    window.history.replaceState({}, '', '/competitions/1')
+    render(<App />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Change password' }))
+    const dialog = screen.getByRole('dialog', { name: 'Change password' })
+    await userEvent.type(within(dialog).getByLabelText('Current password'), 'correct-password')
+    await userEvent.type(within(dialog).getByLabelText('New password'), 'new-personal-password')
+    await userEvent.type(within(dialog).getByLabelText('Confirm new password'), 'new-personal-password')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Change password' }))
+    await screen.findByText('Password changed. Log in again with your new password.')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Change password' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Asylum Demon/ })).not.toBeInTheDocument()
+    expect(screen.getByText('The challengers')).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/competitions/1')
+    expect(server.writes).toContainEqual({ path: '/account/password', body: { current_password: 'correct-password', new_password: 'new-personal-password' }, csrf: 'test-csrf-token' })
+    expect(server.writes.some(write => write.path.endsWith('/attempt/finish'))).toBe(false)
+    await userEvent.click(screen.getByRole('button', { name: 'Player login' }))
+    const login = screen.getByRole('dialog')
+    await userEvent.clear(within(login).getByLabelText('Username'))
+    await userEvent.type(within(login).getByLabelText('Username'), 'oli')
+    await userEvent.type(within(login).getByLabelText('Password'), 'new-personal-password')
+    await userEvent.click(within(login).getByRole('button', { name: 'Enter the ledger' }))
+    await screen.findByRole('button', { name: 'Change password' })
+    expect(window.location.pathname).toBe('/competitions/1')
+  })
+
+  it('rejects mismatched confirmation without making a password request', async () => {
+    const server = makeServer('oli'); vi.stubGlobal('fetch', server.fetchMock)
+    render(<App />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Change password' }))
+    const dialog = screen.getByRole('dialog')
+    await userEvent.type(within(dialog).getByLabelText('Current password'), 'correct-password')
+    await userEvent.type(within(dialog).getByLabelText('New password'), 'new-personal-password')
+    await userEvent.type(within(dialog).getByLabelText('Confirm new password'), 'different-password')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Change password' }))
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('New passwords do not match.')
+    expect(server.writes.filter(write => write.path === '/account/password')).toHaveLength(0)
+  })
+
+  it('keeps a wrong-current-password error and the form draft while the session remains valid', async () => {
+    const server = makeServer('oli'); vi.stubGlobal('fetch', server.fetchMock)
+    render(<App />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Change password' }))
+    const dialog = screen.getByRole('dialog')
+    await userEvent.type(within(dialog).getByLabelText('Current password'), 'wrong-current-password')
+    await userEvent.type(within(dialog).getByLabelText('New password'), 'new-personal-password')
+    await userEvent.type(within(dialog).getByLabelText('Confirm new password'), 'new-personal-password')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Change password' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Current password is incorrect.')
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Change password' })).toBeEnabled())
+    const newPassword = within(dialog).getByLabelText('New password')
+    newPassword.focus(); fireEvent.focus(window)
+    await waitFor(() => expect(server.fetchMock.mock.calls.filter(([path]) => path === '/api/session').length).toBeGreaterThan(2))
+    expect(newPassword).toHaveValue('new-personal-password')
+    expect(newPassword).toHaveFocus()
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Current password is incorrect.')
+    expect(screen.getByRole('button', { name: 'Log out' })).toBeInTheDocument()
+  })
+
+  it('clears password drafts when closed and hides the account form after session expiration', async () => {
+    const server = makeServer('oli'); vi.stubGlobal('fetch', server.fetchMock)
+    render(<App />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Change password' }))
+    let dialog = screen.getByRole('dialog')
+    await userEvent.type(within(dialog).getByLabelText('Current password'), 'some-password')
+    await userEvent.type(within(dialog).getByLabelText('New password'), 'new-personal-password')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Close dialog' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Change password' }))
+    dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByLabelText('Current password')).toHaveValue('')
+    expect(within(dialog).getByLabelText('New password')).toHaveValue('')
+    expect(within(dialog).getByLabelText('Confirm new password')).toHaveValue('')
+    await userEvent.type(within(dialog).getByLabelText('New password'), 'draft-to-be-cleared')
+    server.expireSession(); fireEvent.focus(window)
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: 'Change password' })).not.toBeInTheDocument()
+    expect(screen.getByText('The challengers')).toBeInTheDocument()
+  })
+
+  it('does not offer password changes to anonymous visitors', async () => {
+    const server = makeServer(); vi.stubGlobal('fetch', server.fetchMock)
+    render(<App />)
+    await screen.findByText('The challengers')
+    expect(screen.queryByRole('button', { name: 'Change password' })).not.toBeInTheDocument()
   })
 })

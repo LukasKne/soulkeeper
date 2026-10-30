@@ -373,6 +373,11 @@ class CreateUser(Input):
     password: Password
 
 
+class ChangePassword(Input):
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: Password
+
+
 class UpdateUser(Input):
     password: Password | None = None
     active: StrictBool | None = None
@@ -392,6 +397,7 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
             application.state.settings, load_catalog(catalog_path or Path(__file__).with_name("catalog.json"))
         )
         application.state.login_failures = defaultdict(deque)
+        application.state.password_failures = defaultdict(deque)
         application.state.login_lock = threading.Lock()
         yield
 
@@ -524,6 +530,42 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
     def logout(request: Request, response: Response, authenticated: Annotated[dict, Depends(require_csrf)]):
         with request.app.state.db.transaction() as connection:
             connection.execute("DELETE FROM sessions WHERE token_hash=?", (authenticated["token_hash"],))
+        response.delete_cookie(COOKIE_NAME, path="/", secure=request.app.state.settings.cookie_secure, httponly=True, samesite="strict")
+        return session_view(None)
+
+    @application.post("/api/account/password")
+    def change_password(payload: ChangePassword, request: Request, response: Response, authenticated: Annotated[dict, Depends(require_csrf)]):
+        username = authenticated["username"]
+        timestamp = time.monotonic()
+        with request.app.state.login_lock:
+            failures = request.app.state.password_failures[username]
+            while failures and timestamp - failures[0] >= 60:
+                failures.popleft()
+            if len(failures) >= 5:
+                raise HTTPException(429, "Too many incorrect current passwords. Try again in a minute", headers={"Retry-After": "60"})
+            failures.append(timestamp)
+        with request.app.state.db.connect() as connection:
+            account = connection.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if not hmac.compare_digest(account["password_hash"], password_hash(payload.current_password, account["password_salt"])):
+            raise HTTPException(401, "Current password is incorrect")
+        with request.app.state.login_lock:
+            if timestamp in failures:
+                failures.remove(timestamp)
+        if payload.new_password == payload.current_password:
+            raise HTTPException(422, "Choose a different new password")
+        salt = secrets.token_bytes(16)
+        hashed = password_hash(payload.new_password, salt)
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            current_account = connection.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            if (
+                current_account["auth_version"] != account["auth_version"]
+                or not hmac.compare_digest(current_account["password_salt"], account["password_salt"])
+                or not hmac.compare_digest(current_account["password_hash"], account["password_hash"])
+            ):
+                raise HTTPException(401, "Please sign in")
+            connection.execute("UPDATE users SET password_salt=?,password_hash=?,auth_version=auth_version+1 WHERE username=?", (salt, hashed, username))
+            connection.execute("DELETE FROM sessions WHERE username=?", (username,))
         response.delete_cookie(COOKIE_NAME, path="/", secure=request.app.state.settings.cookie_secure, httponly=True, samesite="strict")
         return session_view(None)
 

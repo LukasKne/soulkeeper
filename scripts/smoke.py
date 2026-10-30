@@ -71,6 +71,15 @@ if sys.argv[2] == "before":
     lukas.call("/api/admin/users/solaire", {"password": config["LUKAS_PASSWORD"] + "-sun"}, "PATCH")
     lukas.call("/api/admin/users/solaire", {"active": False}, "PATCH")
     lukas.call("/api/admin/users/solaire", {"active": True}, "PATCH")
+    solaire = Client()
+    solaire.login("solaire", config["LUKAS_PASSWORD"] + "-sun")
+    changed = solaire.call("/api/account/password", {
+        "current_password": config["LUKAS_PASSWORD"] + "-sun",
+        "new_password": config["OLI_PASSWORD"] + "-sun-new",
+    })
+    assert changed == {"user": None, "csrf_token": None}
+    solaire.call("/api/competitions/2/attempt", expected=401)
+    assert lukas.call("/api/session")["user"]["username"] == "lukas"
     lukas.call(path, {"defeated": False}, "PUT", expected=409)
 else:
     competitions = public.call("/api/competitions")
@@ -86,7 +95,8 @@ else:
     assert {p["username"] for p in public.call("/api/competitions/2/leaderboard")["players"]} == {"lukas", "solaire"}
     assert len(lukas.call("/api/admin/users")["users"]) == 3
     solaire = Client()
-    solaire.login("solaire", config["LUKAS_PASSWORD"] + "-sun")
+    solaire.call("/api/login", {"username": "solaire", "password": config["LUKAS_PASSWORD"] + "-sun"}, expected=401)
+    solaire.login("solaire", config["OLI_PASSWORD"] + "-sun-new")
     assert solaire.call("/api/competitions/2/attempt")["attempt"] is None
     solaire.call("/api/competitions/1/attempt", expected=403)
 print(f'Container smoke checks passed ({sys.argv[2]} recreation).')

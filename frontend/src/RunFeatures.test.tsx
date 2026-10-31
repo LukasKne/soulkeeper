@@ -8,7 +8,7 @@ const catalog = [
   { id: 'boss', name: 'Asylum Demon', kind: 'boss', points: 5 },
   { id: 'mini', name: 'Black Knight', kind: 'miniboss', points: 3 },
   { id: 'shared', name: 'Shared Demon', kind: 'boss', points: 5 },
-].map(entry => ({ ...entry, area_id: 'asylum', area_name: 'Northern Undead Asylum', area_order: 1, description: 'Test encounter', defeated: false })) as Encounter[]
+].map(entry => ({ ...entry, area_id: entry.id === 'shared' ? 'burg' : 'asylum', area_name: entry.id === 'shared' ? 'Undead Burg' : 'Northern Undead Asylum', area_order: entry.id === 'shared' ? 2 : 1, description: 'Test encounter', defeated: false })) as Encounter[]
 const run = (id: number): Competition => ({ id, number: id, name: `Run ${id}`, status: id === 2 ? 'current' : 'archived', max_points: id === 2 ? 13 : 5, created_at: '2026-10-01T00:00:00Z', archived_at: id === 1 ? '2026-10-02T00:00:00Z' : null })
 
 function server(initialUser: string | null = null) {
@@ -131,6 +131,53 @@ describe('Public runs, comparison, and private practice', () => {
     await userEvent.selectOptions(screen.getByRole('combobox', { name: 'First attempt' }), 'run:1')
     expect(window.location.search).toContain('left=run%3A1')
     expect(await screen.findByText('Choose two different attempts to compare.')).toBeInTheDocument()
+  })
+
+  it('collapses comparison locations individually or together and preserves them on refresh', async () => {
+    const api = server(); vi.stubGlobal('fetch', api.fetchMock); window.history.replaceState({}, '', '/compare?run=2')
+    render(<App />)
+    const asylum = await screen.findByRole('button', { name: 'Northern Undead Asylum' })
+    const burg = screen.getByRole('button', { name: 'Undead Burg' })
+    const table = screen.getByRole('table', { name: 'Encounter comparison' })
+    await userEvent.click(asylum)
+    expect(asylum).toHaveAttribute('aria-expanded', 'false')
+    expect(within(table).queryByText('Asylum Demon')).not.toBeInTheDocument()
+    expect(within(table).getByText('Shared Demon')).toBeInTheDocument()
+    const reads = api.calls.filter(path => path.endsWith('/progress')).length
+    fireEvent.focus(window)
+    await waitFor(() => expect(api.calls.filter(path => path.endsWith('/progress')).length).toBeGreaterThan(reads))
+    expect(asylum).toHaveAttribute('aria-expanded', 'false')
+    await userEvent.click(asylum)
+    expect(within(table).getByText('Asylum Demon')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    expect(asylum).toHaveAttribute('aria-expanded', 'false')
+    expect(burg).toHaveAttribute('aria-expanded', 'false')
+    expect(within(table).queryByText('Shared Demon')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    expect(asylum).toHaveAttribute('aria-expanded', 'true')
+    expect(burg).toHaveAttribute('aria-expanded', 'true')
+    expect(within(table).getByText('Shared Demon')).toBeInTheDocument()
+    expect(api.writes).toHaveLength(0)
+  })
+
+  it('reveals comparison search results and still allows collapsing filtered locations', async () => {
+    const api = server(); vi.stubGlobal('fetch', api.fetchMock); window.history.replaceState({}, '', '/compare?run=2')
+    render(<App />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Collapse all' }))
+    await userEvent.type(screen.getByRole('searchbox', { name: 'Search comparison' }), 'Black Knight')
+    const table = screen.getByRole('table', { name: 'Encounter comparison' })
+    expect(within(table).getByText('Black Knight')).toBeInTheDocument()
+    expect(within(table).queryByRole('button', { name: 'Undead Burg' })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    expect(within(table).queryByText('Black Knight')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    expect(within(table).getByText('Black Knight')).toBeInTheDocument()
+    await userEvent.clear(screen.getByRole('searchbox', { name: 'Search comparison' }))
+    expect(within(table).getByText('Shared Demon')).toBeInTheDocument()
+    await userEvent.type(screen.getByRole('searchbox', { name: 'Search comparison' }), 'does not exist')
+    expect(screen.getByText('No encounters match these filters.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Collapse all' })).toBeDisabled()
+    expect(api.writes).toHaveLength(0)
   })
 
   it('keeps private practice comparisons behind the owner account', async () => {

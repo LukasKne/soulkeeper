@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { Encounter } from './types'
+import Chevron from './Chevron'
 
 export default function Checklist({ encounters, editable = false, busy = false, onToggle }: {
   encounters: Encounter[]; editable?: boolean; busy?: boolean; onToggle?: (entry: Encounter) => void
@@ -27,7 +28,7 @@ export default function Checklist({ encounters, editable = false, busy = false, 
       const expanded = !collapsed.has(group.id) || Boolean(needle)
       return <section className="area" key={group.id}>
         <button className="area-heading" aria-expanded={expanded} onClick={() => setCollapsed(previous => { const next = new Set(previous); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next })}>
-          <span className="area-index">{String(group.order).padStart(2, '0')}</span><h3>{group.name}</h3><span className="area-progress">{group.entries.filter(entry => entry.defeated).length}<span> / {group.entries.length}</span></span><span aria-hidden="true">{expanded ? '⌄' : '›'}</span>
+          <span className="area-index">{String(group.order).padStart(2, '0')}</span><h3>{group.name}</h3><span className="area-progress">{group.entries.filter(entry => entry.defeated).length}<span> / {group.entries.length}</span></span><Chevron className={`disclosure-chevron${expanded ? '' : ' collapsed'}`}/>
         </button>
         {expanded && <div className="area-encounters">{group.visible.map(entry => <label className={`encounter ${entry.defeated ? 'defeated' : ''} ${!editable ? 'locked' : ''}`} key={entry.id}>
           <input type="checkbox" checked={entry.defeated} disabled={!editable || busy} onChange={() => onToggle?.(entry)}/>

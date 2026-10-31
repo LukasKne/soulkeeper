@@ -1,7 +1,9 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useId, useMemo, useState } from 'react'
 import type { MouseEvent, ReactNode } from 'react'
 import { api } from './api'
 import Checklist from './Checklist'
+import Chevron from './Chevron'
+import SelectControl from './SelectControl'
 import { usePolling } from './usePolling'
 import type { CompetitionList, Encounter, PlayerRuns, PracticeSummary, PracticeView, RunProgress, Session } from './types'
 
@@ -75,6 +77,8 @@ export function Comparison({ session, competitions, navigate, onLogin, search }:
   const playerParam = params.get('player') ?? session.user?.username ?? ''
   const [filter, setFilter] = useState('')
   const [differences, setDifferences] = useState(false)
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  const areaPrefix = useId()
   const load = useCallback(async (signal: AbortSignal): Promise<ComparisonData> => {
     const progress = await api<RunProgress>(`/competitions/${id}/progress`, { signal })
     const player = playerParam || progress.players[0]?.username || ''
@@ -110,34 +114,47 @@ export function Comparison({ session, competitions, navigate, onLogin, search }:
     if (key === 'run' || key === 'player') { next.delete('left'); next.delete('right') }
     navigate(`/compare?${next}`)
   }
-  const rows = useMemo(() => {
+  const encounters = useMemo(() => {
     const all = new Map<string, { entry: Encounter; left?: Encounter; right?: Encounter }>()
     for (const entry of data?.left?.encounters ?? []) all.set(entry.id, { entry, left: entry })
     for (const entry of data?.right?.encounters ?? []) { const row = all.get(entry.id) ?? { entry }; all.set(entry.id, { ...row, right: entry }) }
-    const needle = filter.trim().toLowerCase()
-    return [...all.values()].filter(row => (!differences || !row.left || !row.right || row.left.defeated !== row.right.defeated || row.left.points !== row.right.points) && (!needle || `${row.entry.name} ${row.entry.area_name} ${row.left?.description ?? ''} ${row.right?.name ?? ''} ${row.right?.area_name ?? ''}`.toLowerCase().includes(needle))).sort((a, b) => a.entry.area_order - b.entry.area_order)
-  }, [data, filter, differences])
+    return [...all.values()].sort((a, b) => a.entry.area_order - b.entry.area_order)
+  }, [data])
+  const needle = filter.trim().toLowerCase()
+  const rows = encounters.filter(row => (!differences || !row.left || !row.right || row.left.defeated !== row.right.defeated || row.left.points !== row.right.points) && (!needle || `${row.entry.name} ${row.entry.area_name} ${row.left?.description ?? ''} ${row.right?.name ?? ''} ${row.right?.area_name ?? ''}`.toLowerCase().includes(needle)))
   const groups = useMemo(() => {
     const areas = new Map<string, { name: string; rows: typeof rows }>()
     for (const row of rows) { if (!areas.has(row.entry.area_id)) areas.set(row.entry.area_id, { name: row.entry.area_name, rows: [] }); areas.get(row.entry.area_id)!.rows.push(row) }
     return [...areas.entries()]
   }, [rows])
+  const allCollapsed = groups.length > 0 && groups.every(([areaId]) => collapsed.has(areaId))
   const names = [...new Set([...(data?.progress.players.map(player => player.username) ?? []), data?.player ?? playerParam, session.user?.username ?? ''].filter(Boolean))]
   return <section className="run-page" aria-labelledby="compare-title">
     <div className="section-heading"><div><p className="eyebrow">SIDE BY SIDE</p><h2 id="compare-title">Direct comparison</h2></div></div>
     <div className="admin-tabs" role="tablist" aria-label="Comparison modes"><button role="tab" aria-selected={!history} onClick={() => navigate(`/compare?run=${id}`)}>Players</button><button role="tab" aria-selected={history} onClick={() => navigate(historyCompare(session.user?.username ?? data?.player ?? playerParam))}>Across runs</button></div>
     {!data ? <><LoadState error={error} retry={() => void refresh()}/>{error && <div className="view-actions"><PageLink to={history ? historyCompare(playerParam) : `/compare?run=${id}`} navigate={navigate}>Reset comparison →</PageLink>{!session.user && <button className="text-button" onClick={onLogin}>Player login</button>}</div>}</> : <>
       <div className="comparison-selectors">
-        {history ? <label>Player<select aria-label="Comparison player" value={data.player} onChange={event => select('player', event.target.value)}>{names.map(name => <option key={name} value={name}>{displayName(name)}</option>)}</select></label> : <label>Run<select aria-label="Comparison run" value={id} onChange={event => select('run', event.target.value)}>{competitions.competitions.map(run => <option key={run.id} value={run.id}>{run.name}</option>)}</select></label>}
-        <label>{history ? 'First attempt' : 'First player'}<select aria-label={history ? 'First attempt' : 'First player'} value={data.leftKey} onChange={event => select('left', event.target.value)}>{data.options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-        <label>{history ? 'Second attempt' : 'Second player'}<select aria-label={history ? 'Second attempt' : 'Second player'} value={data.rightKey} onChange={event => select('right', event.target.value)}><option value="">Choose another…</option>{data.options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+        {history ? <label>Player<SelectControl aria-label="Comparison player" value={data.player} onChange={event => select('player', event.target.value)}>{names.map(name => <option key={name} value={name}>{displayName(name)}</option>)}</SelectControl></label> : <label>Run<SelectControl aria-label="Comparison run" value={id} onChange={event => select('run', event.target.value)}>{competitions.competitions.map(run => <option key={run.id} value={run.id}>{run.name}</option>)}</SelectControl></label>}
+        <label>{history ? 'First attempt' : 'First player'}<SelectControl aria-label={history ? 'First attempt' : 'First player'} value={data.leftKey} onChange={event => select('left', event.target.value)}>{data.options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</SelectControl></label>
+        <label>{history ? 'Second attempt' : 'Second player'}<SelectControl aria-label={history ? 'Second attempt' : 'Second player'} value={data.rightKey} onChange={event => select('right', event.target.value)}><option value="">Choose another…</option>{data.options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</SelectControl></label>
       </div>
       {history && session.user?.username === data.player && <p className="practice-note">Saved practice attempts are visible only to you. <PageLink to="/practice" navigate={navigate}>Open practice →</PageLink></p>}
       {!data.left || !data.right || data.leftKey === data.rightKey ? <div className="empty-panel">Choose two different {history ? 'attempts' : 'players'} to compare.{data.options.length < 2 && <p>{history ? 'Save another practice attempt or join another official run to add a comparison.' : 'This run has fewer than two participants.'}</p>}</div> : <>
         <div className="comparison-cards">{[data.left, data.right].map((attempt, index) => <article className="history-entry" key={index}><h3>{history ? attempt.title : displayName(attempt.username)}</h3><p>{statusLabel(attempt.status)}</p><ScoreLine {...attempt}/>{!history && <PageLink to={`/runs/${id}/players/${encodeURIComponent(attempt.username)}`} navigate={navigate}>Full checklist →</PageLink>}</article>)}</div>
         <p className="comparison-gap" role="status">{data.left.points === data.right.points ? 'Level on points' : `${history ? (data.left.points > data.right.points ? data.left.title : data.right.title) : displayName(data.left.points > data.right.points ? data.left.username : data.right.username)} leads by ${Math.abs(data.left.points - data.right.points)} points`}</p>
-        <div className="ledger-filters"><div className="search-wrap"><input type="search" aria-label="Search comparison" placeholder="Search encounters or locations…" value={filter} onChange={event => setFilter(event.target.value)}/></div><label className="remaining-toggle"><input type="checkbox" checked={differences} onChange={event => setDifferences(event.target.checked)}/><span className="toggle-switch"/>Differences only</label></div>
-        <div className="comparison-table" role="table" aria-label="Encounter comparison"><div className="comparison-row comparison-head" role="row"><span role="columnheader">Encounter</span><span role="columnheader">{history ? data.left.title : displayName(data.left.username)}</span><span role="columnheader">{history ? data.right.title : displayName(data.right.username)}</span></div>{groups.map(([areaId, group]) => <div role="rowgroup" key={areaId}><h3 className="comparison-area">{group.name}</h3>{group.rows.map(row => <div className="comparison-row" role="row" key={row.entry.id}><span role="cell"><strong>{row.entry.name}</strong><small>{row.entry.kind === 'boss' ? 'Boss' : 'Miniboss'}</small></span>{[row.left, row.right].map((entry, index) => <span role="cell" key={index} className={entry?.defeated ? 'comparison-killed' : 'comparison-remaining'}>{!entry ? 'Not in this run' : <><span aria-hidden="true">{entry.defeated ? '✓' : '—'}</span> {entry.defeated ? 'Defeated' : 'Remaining'}<small>+{entry.points}</small></>}</span>)}</div>)}</div>)}{!rows.length && <p className="empty-panel">No encounters match these filters.</p>}</div>
+        <div className="ledger-filters"><div className="search-wrap"><input type="search" aria-label="Search comparison" placeholder="Search encounters or locations…" value={filter} onChange={event => { setFilter(event.target.value); setCollapsed(new Set()) }}/></div><label className="remaining-toggle"><input type="checkbox" checked={differences} onChange={event => setDifferences(event.target.checked)}/><span className="toggle-switch"/>Differences only</label><button className="text-button collapse-button" disabled={!groups.length} onClick={() => setCollapsed(allCollapsed ? new Set() : new Set(encounters.map(row => row.entry.area_id)))}>{allCollapsed ? 'Expand all' : 'Collapse all'}</button></div>
+        <div className="comparison-table" role="table" aria-label="Encounter comparison">
+          <div className="comparison-row comparison-head" role="row"><span role="columnheader">Encounter</span><span role="columnheader">{history ? data.left.title : displayName(data.left.username)}</span><span role="columnheader">{history ? data.right.title : displayName(data.right.username)}</span></div>
+          {groups.map(([areaId, group]) => {
+            const expanded = !collapsed.has(areaId)
+            const contentId = `${areaPrefix}-${areaId}`
+            return <div role="rowgroup" key={areaId}>
+              <div role="row"><div role="cell" aria-colspan={3}><h3 className="comparison-area"><button className="comparison-area-toggle" aria-expanded={expanded} aria-controls={contentId} onClick={() => setCollapsed(previous => { const next = new Set(previous); if (next.has(areaId)) next.delete(areaId); else next.add(areaId); return next })}><span>{group.name}</span><span className="comparison-area-count" aria-hidden="true">{group.rows.length} {group.rows.length === 1 ? 'encounter' : 'encounters'}</span><Chevron className={`disclosure-chevron${expanded ? '' : ' collapsed'}`}/></button></h3></div></div>
+              <div id={contentId} role="presentation">{expanded && group.rows.map(row => <div className="comparison-row" role="row" key={row.entry.id}><span role="cell"><strong>{row.entry.name}</strong><small>{row.entry.kind === 'boss' ? 'Boss' : 'Miniboss'}</small></span>{[row.left, row.right].map((entry, index) => <span role="cell" key={index} className={entry?.defeated ? 'comparison-killed' : 'comparison-remaining'}>{!entry ? 'Not in this run' : <><span aria-hidden="true">{entry.defeated ? '✓' : '—'}</span> {entry.defeated ? 'Defeated' : 'Remaining'}<small>+{entry.points}</small></>}</span>)}</div>)}</div>
+            </div>
+          })}
+          {!rows.length && <p className="empty-panel">No encounters match these filters.</p>}
+        </div>
       </>}
     </>}
   </section>

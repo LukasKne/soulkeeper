@@ -99,7 +99,7 @@ class Database:
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise RuntimeError("This database requires a newer version of Soulkeeper")
             if version == 0:
                 passwords = [settings.passwords.get(username, "") for username in BOOTSTRAP_USERS]
@@ -190,13 +190,18 @@ class Database:
             )
         self.path.chmod(0o600)
         with self.transaction() as connection:
+            if version < 3:
+                connection.execute("CREATE TABLE practice_drafts (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE REFERENCES users(username), catalog TEXT NOT NULL, defeated TEXT NOT NULL, created_at TEXT NOT NULL)")
+                connection.execute("CREATE TABLE practice_history (id TEXT PRIMARY KEY, username TEXT NOT NULL REFERENCES users(username), catalog TEXT NOT NULL, defeated TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('died','ended')), created_at TEXT NOT NULL, saved_at TEXT NOT NULL)")
+                connection.execute("CREATE INDEX practice_history_owner ON practice_history(username,saved_at DESC)")
+                connection.execute("UPDATE competitions SET name='Run ' || number WHERE name='Competition ' || number")
             if version == 0:
                 for username in BOOTSTRAP_USERS:
                     salt = secrets.token_bytes(16)
                     connection.execute("INSERT INTO users VALUES (?, ?, ?, 1, 0)", (username, salt, password_hash(settings.passwords[username], salt)))
             if not connection.execute("SELECT 1 FROM competitions LIMIT 1").fetchone():
                 self.create_competition(connection, 1, now(), list(BOOTSTRAP_USERS))
-            connection.execute("PRAGMA user_version=2")
+            connection.execute("PRAGMA user_version=3")
 
     @contextmanager
     def connect(self):
@@ -223,7 +228,7 @@ class Database:
     def create_competition(self, connection, number: int, timestamp: str, participants: list[str], name: str | None = None) -> int:
         competition_id = connection.execute(
             "INSERT INTO competitions(number, name, status, created_at) VALUES (?, ?, 'current', ?)",
-            (number, name or f"Competition {number}", timestamp),
+            (number, name or f"Run {number}", timestamp),
         ).lastrowid
         connection.executemany("INSERT INTO competition_members VALUES (?, ?)", [(competition_id, username) for username in participants])
         connection.executemany(
@@ -239,7 +244,7 @@ class Database:
 def competition(connection, competition_id: int) -> dict:
     row = connection.execute("SELECT * FROM competitions WHERE id=?", (competition_id,)).fetchone()
     if row is None:
-        raise HTTPException(404, "Competition not found")
+        raise HTTPException(404, "Run not found")
     maximum = connection.execute(
         "SELECT COALESCE(SUM(points), 0) FROM encounters WHERE competition_id=?", (competition_id,)
     ).fetchone()[0]
@@ -286,7 +291,7 @@ def attempt_view(connection, competition_id: int, username: str) -> dict:
 
 def ensure_current(connection, competition_id: int):
     if competition(connection, competition_id)["status"] != "current":
-        raise HTTPException(409, "This competition is archived and cannot be changed")
+        raise HTTPException(409, "This run is archived and cannot be changed")
 
 
 def ensure_active(connection, competition_id: int, username: str):
@@ -304,7 +309,7 @@ def ensure_active(connection, competition_id: int, username: str):
 
 def ensure_member(connection, competition_id: int, username: str):
     if not connection.execute("SELECT 1 FROM competition_members WHERE competition_id=? AND username=?", (competition_id, username)).fetchone():
-        raise HTTPException(403, "You are not a participant in this competition")
+        raise HTTPException(403, "You are not a participant in this run")
 
 
 def user_view(row) -> dict:
@@ -331,6 +336,52 @@ def ensure_live_session(connection, authenticated):
         raise HTTPException(401, "Please sign in")
 
 
+def official_progress(connection, competition_id: int) -> dict:
+    selected = competition(connection, competition_id)
+    players = []
+    for member in connection.execute("SELECT username FROM competition_members WHERE competition_id=? ORDER BY username", (competition_id,)):
+        view = attempt_view(connection, competition_id, member["username"])
+        players.append({
+            "username": member["username"], "attempt": view["attempt"],
+            "attempt_status": view["attempt"]["status"] if view["attempt"] else "not_started",
+            **totals(connection, competition_id, member["username"]),
+            "defeated_ids": [entry["id"] for entry in view["encounters"] if entry["defeated"]],
+        })
+    encounters = [json.loads(row[0]) for row in connection.execute("SELECT data FROM encounters WHERE competition_id=? ORDER BY sort_order", (competition_id,))]
+    return {"competition": selected, "players": players, "encounters": encounters}
+
+
+def new_practice(connection, username: str, catalog: list[dict]):
+    identifier = secrets.token_urlsafe(18)
+    connection.execute("INSERT INTO practice_drafts VALUES (?, ?, ?, '[]', ?)", (identifier, username, json.dumps(catalog), now()))
+    return connection.execute("SELECT * FROM practice_drafts WHERE id=?", (identifier,)).fetchone()
+
+
+def practice_summary(row) -> dict:
+    catalog, defeated = json.loads(row["catalog"]), set(json.loads(row["defeated"]))
+    checked = [entry for entry in catalog if entry["id"] in defeated]
+    saved = "outcome" in row.keys()
+    return {
+        "id": row["id"], "username": row["username"], "created_at": row["created_at"],
+        "outcome": row["outcome"] if saved else None, "saved_at": row["saved_at"] if saved else None,
+        "points": sum(entry["points"] for entry in checked), "max_points": sum(entry["points"] for entry in catalog),
+        "bosses_defeated": sum(entry["kind"] == "boss" for entry in checked),
+        "minibosses_defeated": sum(entry["kind"] == "miniboss" for entry in checked),
+    }
+
+
+def practice_view(row) -> dict:
+    defeated = set(json.loads(row["defeated"]))
+    return {**practice_summary(row), "encounters": [{**entry, "defeated": entry["id"] in defeated} for entry in json.loads(row["catalog"])]}
+
+
+def require_practice(connection, identifier: str, username: str):
+    row = connection.execute("SELECT * FROM practice_drafts WHERE username=?", (username,)).fetchone()
+    if row is None or row["id"] != identifier:
+        raise HTTPException(409, "Your practice draft changed. Refresh before continuing")
+    return row
+
+
 class Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -346,6 +397,10 @@ class Kill(Input):
 
 class Finish(Input):
     outcome: Literal["failed", "completed"]
+
+
+class SavePractice(Input):
+    outcome: Literal["died", "ended"]
 
 
 Username = Annotated[str, Field(pattern=r"^[a-z0-9_-]{3,32}$", strict=True)]
@@ -364,7 +419,7 @@ class NewCompetition(Participants):
     @classmethod
     def clean_name(cls, value):
         if value is not None and not value.strip():
-            raise ValueError("Competition name cannot be empty")
+            raise ValueError("Run name cannot be empty")
         return value.strip() if value is not None else None
 
 
@@ -454,12 +509,12 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
 
     def require_admin(authenticated: Annotated[dict, Depends(require_session)]):
         if authenticated["username"] != ADMIN:
-            raise HTTPException(403, "Only lukas can manage players and competitions")
+            raise HTTPException(403, "Only lukas can manage players and runs")
         return authenticated
 
     def require_admin_csrf(authenticated: Annotated[dict, Depends(require_csrf)]):
         if authenticated["username"] != ADMIN:
-            raise HTTPException(403, "Only lukas can manage players and competitions")
+            raise HTTPException(403, "Only lukas can manage players and runs")
         return authenticated
 
     def session_view(authenticated):
@@ -666,6 +721,25 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
             connection.execute("BEGIN")
             return attempt_view(connection, competition_id, authenticated["username"])
 
+    @application.get("/api/competitions/{competition_id}/progress")
+    def public_progress(competition_id: int, request: Request):
+        with request.app.state.db.connect() as connection:
+            connection.execute("BEGIN")
+            return official_progress(connection, competition_id)
+
+    @application.get("/api/players/{username}/runs")
+    def player_runs(username: str, request: Request):
+        with request.app.state.db.connect() as connection:
+            connection.execute("BEGIN")
+            if not connection.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+                raise HTTPException(404, "Player not found")
+            rows = connection.execute("SELECT c.id FROM competitions c JOIN competition_members m ON m.competition_id=c.id WHERE m.username=? ORDER BY c.number DESC", (username,)).fetchall()
+            runs = []
+            for row in rows:
+                view = attempt_view(connection, row["id"], username)
+                runs.append({"competition": view["competition"], "attempt": view["attempt"], "attempt_status": view["attempt"]["status"] if view["attempt"] else "not_started", **totals(connection, row["id"], username)})
+            return {"username": username, "runs": runs}
+
     @application.post("/api/competitions/{competition_id}/attempt/start")
     def start_attempt(competition_id: int, request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
         with request.app.state.db.transaction() as connection:
@@ -676,7 +750,7 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
                 "SELECT status FROM attempts WHERE competition_id=? AND username=?", (competition_id, authenticated["username"])
             ).fetchone()
             if existing and existing["status"] != "active":
-                raise HTTPException(409, "You have already used your attempt in this competition")
+                raise HTTPException(409, "You have already used your attempt in this run")
             if existing is None:
                 connection.execute("INSERT INTO attempts VALUES (?, ?, 'active', ?, NULL)", (competition_id, authenticated["username"], now()))
             return attempt_view(connection, competition_id, authenticated["username"])
@@ -722,12 +796,91 @@ def create_app(settings: Settings | None = None, catalog_path: Path | None = Non
             ensure_live_session(connection, authenticated)
             current = connection.execute("SELECT * FROM competitions WHERE status='current'").fetchone()
             if current["id"] != payload.expected_current_id:
-                raise HTTPException(409, "The current competition changed. Refresh before creating another")
+                raise HTTPException(409, "The current run changed. Refresh before creating another")
             validate_participants(connection, payload.participants)
             timestamp = now()
             connection.execute("UPDATE competitions SET status='archived', archived_at=? WHERE id=?", (timestamp, current["id"]))
             new_id = request.app.state.db.create_competition(connection, current["number"] + 1, timestamp, payload.participants, payload.name)
             return {"competition": competition(connection, new_id), "current_id": new_id}
+
+    @application.post("/api/practice")
+    def open_practice(request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            row = connection.execute("SELECT * FROM practice_drafts WHERE username=?", (authenticated["username"],)).fetchone()
+            return practice_view(row if row else new_practice(connection, authenticated["username"], request.app.state.db.catalog))
+
+    @application.get("/api/practice")
+    def get_practice(request: Request, authenticated: Annotated[dict, Depends(require_session)]):
+        with request.app.state.db.connect() as connection:
+            row = connection.execute("SELECT * FROM practice_drafts WHERE username=?", (authenticated["username"],)).fetchone()
+            if row is None:
+                raise HTTPException(404, "Open practice to create your first draft")
+            return practice_view(row)
+
+    @application.put("/api/practice/{draft_id}/encounters/{encounter_id}")
+    def check_practice(draft_id: str, encounter_id: str, payload: Kill, request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            row = require_practice(connection, draft_id, authenticated["username"])
+            if encounter_id not in {entry["id"] for entry in json.loads(row["catalog"])}:
+                raise HTTPException(404, "Encounter not found")
+            defeated = set(json.loads(row["defeated"]))
+            if payload.defeated:
+                defeated.add(encounter_id)
+            else:
+                defeated.discard(encounter_id)
+            connection.execute("UPDATE practice_drafts SET defeated=? WHERE id=?", (json.dumps(sorted(defeated)), draft_id))
+            return practice_view(require_practice(connection, draft_id, authenticated["username"]))
+
+    @application.post("/api/practice/{draft_id}/save")
+    def save_practice(draft_id: str, payload: SavePractice, request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            row = require_practice(connection, draft_id, authenticated["username"])
+            history_id = secrets.token_urlsafe(18)
+            connection.execute("INSERT INTO practice_history VALUES (?, ?, ?, ?, ?, ?, ?)", (history_id, authenticated["username"], row["catalog"], row["defeated"], payload.outcome, row["created_at"], now()))
+            connection.execute("DELETE FROM practice_drafts WHERE id=?", (draft_id,))
+            fresh = new_practice(connection, authenticated["username"], request.app.state.db.catalog)
+            saved = connection.execute("SELECT * FROM practice_history WHERE id=?", (history_id,)).fetchone()
+            return {"draft": practice_view(fresh), "saved": practice_summary(saved)}
+
+    @application.post("/api/practice/{draft_id}/reset")
+    def reset_practice(draft_id: str, request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            require_practice(connection, draft_id, authenticated["username"])
+            connection.execute("DELETE FROM practice_drafts WHERE id=?", (draft_id,))
+            return practice_view(new_practice(connection, authenticated["username"], request.app.state.db.catalog))
+
+    @application.get("/api/practice/history")
+    def practice_history(request: Request, authenticated: Annotated[dict, Depends(require_session)]):
+        with request.app.state.db.connect() as connection:
+            return {"attempts": [practice_summary(row) for row in connection.execute("SELECT * FROM practice_history WHERE username=? ORDER BY saved_at DESC,id DESC", (authenticated["username"],))]}
+
+    @application.get("/api/practice/history/{history_id}")
+    def practice_record(history_id: str, request: Request, authenticated: Annotated[dict, Depends(require_session)]):
+        with request.app.state.db.connect() as connection:
+            row = connection.execute("SELECT * FROM practice_history WHERE id=? AND username=?", (history_id, authenticated["username"])).fetchone()
+            if row is None:
+                raise HTTPException(404, "Saved practice not found")
+            return practice_view(row)
+
+    @application.delete("/api/practice/history/{history_id}")
+    def delete_practice_record(history_id: str, request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            deleted = connection.execute("DELETE FROM practice_history WHERE id=? AND username=?", (history_id, authenticated["username"])).rowcount
+            if not deleted:
+                raise HTTPException(404, "Saved practice not found")
+            return {"deleted": deleted}
+
+    @application.delete("/api/practice/history")
+    def delete_all_practice(request: Request, authenticated: Annotated[dict, Depends(require_csrf)]):
+        with request.app.state.db.transaction() as connection:
+            ensure_live_session(connection, authenticated)
+            deleted = connection.execute("DELETE FROM practice_history WHERE username=?", (authenticated["username"],)).rowcount
+            return {"deleted": deleted}
 
     @application.get("/{path:path}")
     def frontend(path: str, request: Request):

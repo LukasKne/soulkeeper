@@ -80,6 +80,16 @@ if sys.argv[2] == "before":
     assert changed == {"user": None, "csrf_token": None}
     solaire.call("/api/competitions/2/attempt", expected=401)
     assert lukas.call("/api/session")["user"]["username"] == "lukas"
+    solaire.login("solaire", config["OLI_PASSWORD"] + "-sun-new")
+    practice = solaire.call("/api/practice", {})
+    solaire.call(f'/api/practice/{practice["id"]}/encounters/{boss["id"]}', {"defeated": True}, "PUT")
+    saved = solaire.call(f'/api/practice/{practice["id"]}/save', {"outcome": "died"})
+    assert saved["saved"]["points"] == 5 and saved["draft"]["points"] == 0
+    practice = solaire.call(f'/api/practice/{saved["draft"]["id"]}/reset', {})
+    mini = next(entry for entry in practice["encounters"] if entry["kind"] == "miniboss")
+    solaire.call(f'/api/practice/{practice["id"]}/encounters/{mini["id"]}', {"defeated": True}, "PUT")
+    assert public.call("/api/competitions/1/progress")["competition"]["name"] == "Run 1"
+    assert len(public.call("/api/players/lukas/runs")["runs"]) == 2
     lukas.call(path, {"defeated": False}, "PUT", expected=409)
 else:
     competitions = public.call("/api/competitions")
@@ -99,4 +109,13 @@ else:
     solaire.login("solaire", config["OLI_PASSWORD"] + "-sun-new")
     assert solaire.call("/api/competitions/2/attempt")["attempt"] is None
     solaire.call("/api/competitions/1/attempt", expected=403)
+    assert solaire.call("/api/practice")["points"] == 3
+    history = solaire.call("/api/practice/history")["attempts"]
+    assert len(history) == 1 and history[0]["points"] == 5 and history[0]["outcome"] == "died"
+    saved = solaire.call("/api/practice/history/" + history[0]["id"])
+    assert sum(entry["defeated"] for entry in saved["encounters"]) == 1
+    lukas.call("/api/practice/history/" + history[0]["id"], expected=404)
+    solaire.call("/api/practice/history", method="DELETE")
+    assert solaire.call("/api/practice")["points"] == 3
+    assert len(public.call("/api/players/solaire/runs")["runs"]) == 1
 print(f'Container smoke checks passed ({sys.argv[2]} recreation).')

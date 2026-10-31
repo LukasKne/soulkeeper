@@ -70,7 +70,7 @@ def test_public_leaderboard_starts_tied_without_disclosing_checklists(app):
     assert result.status_code == 200
     assert result.headers["cache-control"] == "no-store"
     body = result.json()
-    assert body["competition"]["name"] == "Competition 1"
+    assert body["competition"]["name"] == "Run 1"
     assert body["max_points"] == 8
     assert {player["username"] for player in body["players"]} == {"lukas", "oli"}
     assert all(player["rank"] == 1 and player["attempt_status"] == "not_started" and player["points"] == 0 for player in body["players"])
@@ -171,7 +171,7 @@ def test_manager_creates_fresh_competition_and_freezes_old_attempts(app):
     assert create_next(other, other_headers).status_code == 403
     created = create_next(client, headers)
     assert created.status_code == 200
-    assert created.json()["competition"]["name"] == "Competition 2"
+    assert created.json()["competition"]["name"] == "Run 2"
     assert created.json()["current_id"] == 2
     assert create_next(client, headers).status_code == 409
     assert client.get("/api/competitions").json()["current_id"] == 2
@@ -558,12 +558,13 @@ def test_v1_migration_preserves_realistic_history_passwords_and_sessions(setup, 
     application = create_app(migrated_settings, catalog)
     with TestClient(application) as client:
         with application.state.db.connect() as migrated:
-            assert migrated.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert migrated.execute("PRAGMA user_version").fetchone()[0] == 3
             assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
             for table in tables:
                 rows = [tuple(row) for row in migrated.execute(f"SELECT * FROM {table} ORDER BY rowid")]
-                assert ([row[:3] for row in rows] if table == "users" else rows) == before[table]
+                expected = [(row[0], row[1], f"Run {row[1]}", *row[3:]) for row in before[table]] if table == "competitions" else before[table]
+                assert ([row[:3] for row in rows] if table == "users" else rows) == expected
             assert len(migrated.execute("SELECT * FROM competition_members").fetchall()) == 4
         client.cookies.set(COOKIE_NAME, legacy_token)
         assert client.get("/api/session").json()["user"]["username"] == "lukas"

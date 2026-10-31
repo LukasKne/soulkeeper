@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event'
 import App from './App'
 import type { AdminUser, AttemptView, Competition, Session, Username } from './types'
 
-const makeCompetition = (id: number, status: Competition['status']): Competition => ({ id, number: id, name: `Competition ${id}`, status, created_at: '2026-10-29T12:00:00Z', archived_at: status === 'archived' ? '2026-10-30T12:00:00Z' : null, max_points: 310 })
+const makeCompetition = (id: number, status: Competition['status']): Competition => ({ id, number: id, name: `Run ${id}`, status, created_at: '2026-10-29T12:00:00Z', archived_at: status === 'archived' ? '2026-10-30T12:00:00Z' : null, max_points: 310 })
 
 function makeServer(initialUser: Username | null = null) {
   let user = initialUser
@@ -63,7 +63,7 @@ function makeServer(initialUser: Username | null = null) {
     if (path === '/competitions' && method === 'POST') {
       if (body.expected_current_id !== current) return reply({ detail: 'The current competition changed.' }, 409)
       competitions = competitions.map(item => ({ ...item, status: 'archived', archived_at: '2026-10-30T12:00:00Z' }))
-      current += 1; competitions.unshift({ ...makeCompetition(current, 'current'), name: body.name || `Competition ${current}` }); attempts[current] = null; participants[current] = body.participants
+      current += 1; competitions.unshift({ ...makeCompetition(current, 'current'), name: body.name || `Run ${current}` }); attempts[current] = null; participants[current] = body.participants
       return reply({ competition: competitions[0], current_id: current })
     }
     const match = path.match(/^\/competitions\/(\d+)\/(.*)$/)
@@ -74,7 +74,7 @@ function makeServer(initialUser: Username | null = null) {
       { username, rank: 1, attempt_status: 'failed', points: 13, bosses_defeated: 2, minibosses_defeated: 1 } :
       { username, rank: 1, attempt_status: attempts[id]?.status ?? 'not_started', points: attempts[id]?.points ?? 0, bosses_defeated: attempts[id]?.bosses_defeated ?? 0, minibosses_defeated: 0 }),
     })
-    if (action === 'attempt') return assigned && participants[id].includes(user!) ? reply(own(id)) : reply({ detail: 'You are not assigned to this competition.' }, 403)
+    if (action === 'attempt') return assigned && participants[id].includes(user!) ? reply(own(id)) : reply({ detail: 'You are not assigned to this run.' }, 403)
     if (action === 'attempt/encounters/asylum-demon') {
       if (saveFails) return reply({ detail: 'Could not save this victory. Please try again.' }, 503)
       if (competition.status === 'archived') return reply({ detail: 'This competition is archived.' }, 409)
@@ -96,14 +96,14 @@ describe('Soulkeeper journeys', () => {
   it('keeps archived leaderboards in the visible selector with permanent links', async () => {
     const server = makeServer(); vi.stubGlobal('fetch', server.fetchMock)
     render(<App />)
-    const select = await screen.findByRole('combobox', { name: 'Browse competitions' })
+    const select = await screen.findByRole('combobox', { name: 'Browse runs' })
     await waitFor(() => expect(select).toHaveValue('2'))
-    expect(within(select).getByRole('option', { name: 'Competition 1 · Archived' })).toBeInTheDocument()
+    expect(within(select).getByRole('option', { name: 'Run 1 · Archived' })).toBeInTheDocument()
     await userEvent.selectOptions(select, '1')
     expect(await screen.findByText('This chapter is preserved.')).toBeInTheDocument()
-    expect(window.location.pathname).toBe('/competitions/1')
+    expect(window.location.pathname).toBe('/runs/1')
     expect(screen.getByText('Archived leaderboard')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /View current competition/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /View current run/ })).toBeInTheDocument()
   })
 
   it('logs in and saves an owned checkbox with the session CSRF token', async () => {
@@ -154,9 +154,9 @@ describe('Soulkeeper journeys', () => {
     server.archiveCurrent(); fireEvent.focus(window)
     await screen.findByText('This chapter is preserved.')
     expect(encounter).toBeDisabled()
-    expect(window.location.pathname).toBe('/competitions/2')
-    expect(screen.getByRole('combobox', { name: 'Browse competitions' })).toHaveValue('2')
-    expect(screen.getByRole('option', { name: 'Competition 3 · Current' })).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/runs/2')
+    expect(screen.getByRole('combobox', { name: 'Browse runs' })).toHaveValue('2')
+    expect(screen.getByRole('option', { name: 'Run 3 · Current' })).toBeInTheDocument()
     expect(within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm death' })).toBeDisabled()
   })
 
@@ -176,13 +176,13 @@ describe('Soulkeeper journeys', () => {
     const server = makeServer('lukas'); vi.stubGlobal('fetch', server.fetchMock)
     render(<App />)
     await userEvent.click(await screen.findByRole('link', { name: 'Admin' }))
-    await userEvent.click(await screen.findByRole('button', { name: /Create next competition/ }))
+    await userEvent.click(await screen.findByRole('button', { name: /Create next run/ }))
     const dialog = screen.getByRole('dialog')
     expect(dialog).toHaveTextContent('All old scores, life statuses, and checklists will stay visible and read-only.')
-    await userEvent.click(within(dialog).getByRole('button', { name: 'Create next competition' }))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Create next run' }))
     await screen.findByRole('button', { name: /Start my attempt/ })
-    expect(window.location.pathname).toBe('/competitions/3')
-    expect(screen.getByRole('option', { name: 'Competition 2 · Archived' })).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/runs/3')
+    expect(screen.getByRole('option', { name: 'Run 2 · Archived' })).toBeInTheDocument()
     expect(server.writes).toContainEqual({ path: '/competitions', body: { expected_current_id: 2, participants: ['lukas', 'oli'] }, csrf: 'test-csrf-token' })
   })
 
@@ -196,7 +196,7 @@ describe('Soulkeeper journeys', () => {
     await userEvent.type(within(dialog).getByLabelText('Username'), 'charlie')
     await userEvent.type(within(dialog).getByLabelText('Password'), 'correct-password')
     await userEvent.click(within(dialog).getByRole('button', { name: 'Enter the ledger' }))
-    await screen.findByText('You are not assigned to this competition.')
+    await screen.findByText('You are not assigned to this run.')
     expect(server.writes).toContainEqual({ path: '/login', body: { username: 'charlie', password: 'correct-password' }, csrf: undefined })
     expect(screen.queryByRole('link', { name: 'Admin' })).not.toBeInTheDocument()
     expect(screen.getByText('The challengers')).toBeInTheDocument()
@@ -207,7 +207,7 @@ describe('Soulkeeper journeys', () => {
     render(<App />)
     expect(await screen.findByRole('checkbox', { name: /Asylum Demon/ })).toBeEnabled()
     server.removeAssignment(); fireEvent.focus(window)
-    await screen.findByText('You are not assigned to this competition.')
+    await screen.findByText('You are not assigned to this run.')
     expect(screen.queryByRole('checkbox', { name: /Asylum Demon/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'I died' })).not.toBeInTheDocument()
     expect(screen.getByText('The challengers')).toBeInTheDocument()
@@ -221,7 +221,7 @@ describe('Soulkeeper journeys', () => {
     await userEvent.type(screen.getByLabelText('Username'), 'charlie')
     await userEvent.type(screen.getByLabelText('Initial password'), 'new-player-password')
     await userEvent.click(screen.getByRole('button', { name: 'Create user' }))
-    await screen.findByText('Charlie was created. Assign them to a competition to let them play.')
+    await screen.findByText('Charlie was created. Assign them to a run to let them play.')
     expect(screen.getByRole('button', { name: 'Disable lukas' })).toBeDisabled()
     await userEvent.type(screen.getByLabelText('Username'), 'charlie')
     await userEvent.type(screen.getByLabelText('Initial password'), 'another-password')
@@ -233,7 +233,7 @@ describe('Soulkeeper journeys', () => {
     await userEvent.click(within(dialog).getByRole('button', { name: 'Reset password' }))
     await screen.findByText('Charlie’s password was updated and their existing sessions were signed out.')
     await userEvent.click(screen.getByRole('button', { name: 'Disable charlie' }))
-    await screen.findByText('Charlie is disabled. Existing competition records are preserved.')
+    await screen.findByText('Charlie is disabled. Existing run records are preserved.')
     expect(screen.getByRole('button', { name: 'Enable charlie' })).toBeEnabled()
     expect(server.writes).toContainEqual({ path: '/admin/users/charlie', body: { password: 'replacement-password' }, csrf: 'test-csrf-token' })
     expect(server.writes).toContainEqual({ path: '/admin/users/charlie', body: { active: false }, csrf: 'test-csrf-token' })
@@ -255,11 +255,11 @@ describe('Soulkeeper journeys', () => {
   it('edits current participants and shows the server refusal to remove a started player', async () => {
     const server = makeServer('lukas'); vi.stubGlobal('fetch', server.fetchMock); window.history.replaceState({}, '', '/manage')
     render(<App />)
-    const group = await screen.findByRole('group', { name: 'Current competition players' })
+    const group = await screen.findByRole('group', { name: 'Current run players' })
     const oli = await within(group).findByRole('checkbox', { name: 'Oli' })
     await userEvent.click(oli)
     await userEvent.click(screen.getByRole('button', { name: 'Save participants' }))
-    await screen.findByText('Competition participants were updated.')
+    await screen.findByText('Run participants were updated.')
     expect(server.writes).toContainEqual({ path: '/admin/competitions/2/participants', body: { participants: ['lukas'] }, csrf: 'test-csrf-token' })
     await userEvent.click(oli)
     await userEvent.click(within(group).getByRole('checkbox', { name: 'Lukas' }))
@@ -272,14 +272,14 @@ describe('Soulkeeper journeys', () => {
   it('creates a named competition with only the selected participants', async () => {
     const server = makeServer('lukas'); vi.stubGlobal('fetch', server.fetchMock); window.history.replaceState({}, '', '/admin')
     render(<App />)
-    const group = await screen.findByRole('group', { name: 'Players in the new competition' })
+    const group = await screen.findByRole('group', { name: 'Players in the new run' })
     await userEvent.click(await within(group).findByRole('checkbox', { name: 'Lukas' }))
-    await userEvent.type(screen.getByLabelText(/Competition name/), 'No Death Friday')
-    await userEvent.click(screen.getByRole('button', { name: 'Create next competition' }))
+    await userEvent.type(screen.getByLabelText(/Run name/), 'No Death Friday')
+    await userEvent.click(screen.getByRole('button', { name: 'Create next run' }))
     const dialog = screen.getByRole('dialog')
     expect(dialog).toHaveTextContent('Players: Oli')
-    await userEvent.click(within(dialog).getByRole('button', { name: 'Create next competition' }))
-    await screen.findByText('You are not assigned to this competition.')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Create next run' }))
+    await screen.findByText('You are not assigned to this run.')
     expect(screen.getByRole('heading', { name: 'No Death Friday' })).toBeInTheDocument()
     expect(server.writes).toContainEqual({ path: '/competitions', body: { expected_current_id: 2, participants: ['oli'], name: 'No Death Friday' }, csrf: 'test-csrf-token' })
   })
@@ -299,7 +299,7 @@ describe('Soulkeeper journeys', () => {
     expect(screen.queryByRole('button', { name: 'Change password' })).not.toBeInTheDocument()
     expect(screen.queryByRole('checkbox', { name: /Asylum Demon/ })).not.toBeInTheDocument()
     expect(screen.getByText('The challengers')).toBeInTheDocument()
-    expect(window.location.pathname).toBe('/competitions/1')
+    expect(window.location.pathname).toBe('/runs/1')
     expect(server.writes).toContainEqual({ path: '/account/password', body: { current_password: 'correct-password', new_password: 'new-personal-password' }, csrf: 'test-csrf-token' })
     expect(server.writes.some(write => write.path.endsWith('/attempt/finish'))).toBe(false)
     await userEvent.click(screen.getByRole('button', { name: 'Player login' }))
@@ -309,7 +309,7 @@ describe('Soulkeeper journeys', () => {
     await userEvent.type(within(login).getByLabelText('Password'), 'new-personal-password')
     await userEvent.click(within(login).getByRole('button', { name: 'Enter the ledger' }))
     await screen.findByRole('button', { name: 'Change password' })
-    expect(window.location.pathname).toBe('/competitions/1')
+    expect(window.location.pathname).toBe('/runs/1')
   })
 
   it('rejects mismatched confirmation without making a password request', async () => {

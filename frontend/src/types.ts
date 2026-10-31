@@ -17,3 +17,12 @@ export type Leaderboard = { competition: Competition; players: Player[]; max_poi
 export type Encounter = { id: string; area_id: string; area_name: string; area_order: number; name: string; description: string; kind: 'boss' | 'miniboss'; points: number; defeated: boolean }
 export type Attempt = { status: AttemptStatus; started_at: string; ended_at: string | null; points: number; bosses_defeated: number; minibosses_defeated: number }
 export type AttemptView = { competition: Competition; attempt: Attempt | null; encounters: Encounter[] }
+export type ProgressPlayer = Omit<Player, 'rank'> & { attempt: Attempt | null; defeated_ids: string[] }
+export type RunProgress = { competition: Competition; players: ProgressPlayer[]; encounters: Omit<Encounter, 'defeated'>[] }
+export type PlayerRun = Omit<ProgressPlayer, 'username' | 'defeated_ids'> & { competition: Competition }
+export type PlayerRuns = { username: string; runs: PlayerRun[] }
+export type PracticeSummary = {
+  id: string; username: string; created_at: string; saved_at: string | null; outcome: 'died' | 'ended' | null
+  points: number; max_points: number; bosses_defeated: number; minibosses_defeated: number
+}
+export type PracticeView = PracticeSummary & { encounters: Encounter[] }
